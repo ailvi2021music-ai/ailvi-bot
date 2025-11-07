@@ -1,55 +1,70 @@
 import os
 import threading
 from flask import Flask
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-)
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters
 from openai import OpenAI
 
+# -------------------------
+# 🔑 API ключи
+# -------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-flask_app = Flask(__name__)
 
-# -------- Telegram handlers --------
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = (update.message.text or "").strip()
+# -------------------------
+# ✅ Flask health-check
+# -------------------------
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "AILVI bot is alive"
+
+def run_flask():
+    app.run(host="0.0.0.0", port=10000)
+
+# -------------------------
+# ✅ Telegram logic
+# -------------------------
+
+async def handle_message(update, context):
+    user_text = update.message.text
+
+    # Создаём диалог с GPT
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": "You are AILVI — a gentle guide who helps a person unpack themselves."},
-            {"role": "user", "content": user_text},
+            {"role": "system", "content": "Ты — мягкий, спокойный и добрый проводник AILVI. Ты помогаешь человеку распаковывать личность шаг за шагом, задаёшь вопросы, мягко направляешь и не отвечаешь за него."},
+            {"role": "user", "content": user_text}
         ]
     )
+
     answer = response.choices[0].message["content"]
     await update.message.reply_text(answer)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Ассаляму Алейкум. Я готов работать.")
+async def start(update, context):
+    await update.message.reply_text("Ассаламу Алейкум. Я готов работать с тобой.")
 
-def build_application():
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    return app
 
-# -------- Health endpoint for Render --------
-@flask_app.get("/")
-def health():
-    return "OK", 200
+def run_telegram():
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-def run_flask():
-    port = int(os.getenv("PORT", 10000))
-    print(f"✅ Flask health server on port {port}")
-    flask_app.run(host="0.0.0.0", port=port)
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-if __name__ == "__main__":
-    # 1) Запускаем Flask в фоновом потоке
-    threading.Thread(target=run_flask, daemon=True).start()
-
-    # 2) Telegram-пуллинг запускаем в ГЛАВНОМ потоке (так корректно для asyncio)
-    application = build_application()
     print("✅ Telegram polling started")
     application.run_polling()
+
+
+# -------------------------
+# ✅ Main section
+# -------------------------
+if __name__ == "__main__":
+    # Запускаем Flask в отдельном потоке
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+
+    # Запускаем Telegram бота
+    run_telegram()
