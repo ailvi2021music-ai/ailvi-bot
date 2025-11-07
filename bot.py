@@ -1,202 +1,169 @@
 import os
-import asyncio
 import logging
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from flask import Flask
+from openai import OpenAI
 
-from telegram import Update
+from telegram import (
+    Update,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    BotCommand,
+)
 from telegram.ext import (
     ApplicationBuilder,
+    ContextTypes,
     CommandHandler,
     MessageHandler,
-    ContextTypes,
+    CallbackQueryHandler,
     filters,
 )
 
-# === OpenAI SDK ===
-# Используем новый клиент. Модель задаётся через переменную окружения MODEL.
-try:
-    from openai import OpenAI
-except Exception as e:
-    raise RuntimeError(
-        "OpenAI SDK not найден. Убедись, что в requirements.txt есть 'openai>=1.40.0'"
-    ) from e
-
-
-# --------------------------- Конфигурация --------------------------- #
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-MODEL = os.getenv("MODEL", "gpt-4.1-mini")  # можешь сменить на gpt-5-mini, когда будет оплата
-
-FREE_MESSAGE_LIMIT = int(os.getenv("FREE_MESSAGE_LIMIT", "10"))
-
-if not OPENAI_API_KEY:
-    raise RuntimeError("Переменная окружения OPENAI_API_KEY не задана")
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("Переменная окружения TELEGRAM_BOT_TOKEN не задана")
-
-client = OpenAI(api_key=OPENAI_API_KEY)
-
+# -----------------------------
+# Конфигурация и клиенты
+# -----------------------------
 logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
 )
 logger = logging.getLogger("ailvi-bot")
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# --------------------------- Память сессий --------------------------- #
-# Простая in-memory память (на Render free-инстансе с перезапуском это нормально).
-# Для продакшена лучше Redis/DB.
-USER_STATE = {}  # {user_id: {"count": int, "history": [ {"role":"user/assistant", "content": "..."} ] }}
+if not OPENAI_API_KEY or not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("Нужно задать переменные окружения OPENAI_API_KEY и TELEGRAM_BOT_TOKEN")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 
-# --------------------------- Тексты --------------------------- #
-
-WELCOME_TEXT = (
+# -----------------------------
+# Текст приветствия
+# -----------------------------
+GREETING = (
     "Ассаляму Алейкум уа РахматуЛлахи уа Баракятух! 👋🏻\n\n"
     "Добро пожаловать в пространство, где Сердце узнаёт себя заново.\n\n"
     "Давай вместе, спокойно, шаг за шагом откроем драгоценные дары, которые Аллах уже вложил в твою Душу — "
     "силы, таланты, намерения, которые ждут, когда ты увидишь их Свет. 💎\n\n"
-    "Пусть Аллах сделает этот путь лёгким, благословенным и наполненным пониманием!"
+    "Пусть Аллах сделает этот путь лёгким, благословенным и наполненным пониманием! 🚀"
 )
 
-PAYWALL_TEXT = (
-    "Я вижу, что тебе это важно — ты задал(а) уже несколько вопросов. ❤️‍🔥\n\n"
-    "Чтобы я продолжал сопровождать тебя глубже и чаще, включи полную версию. "
-    "Она откроет безлимитные ответы, сохранение прогресса и персональные мини-эксперименты.\n\n"
-    "Если хочешь — напиши «продолжить», и я ещё дам 1–2 ответа, а затем подскажу, как оформить подписку."
+SYSTEM_PROMPT = (
+    "Ты — AILVI: мягкий, бережный проводник. "
+    "Помогаешь человеку распаковать сильные стороны, ценности и естественные роли, "
+    "поддерживая верой, спокойной ясностью и конкретными микрошагами. "
+    "Пиши кратко, чётко, человечно. Уважай Ислам: избегай всего харам, поощряй искреннее обращение к Аллаху. "
+    "Когда уместно — задавай один простой вопрос, чтобы помочь человеку увидеть себя яснее."
 )
 
-
-# --------------------------- Хелперы --------------------------- #
-
-def get_user_state(user_id: int):
-    if user_id not in USER_STATE:
-        USER_STATE[user_id] = {"count": 0, "history": []}
-    return USER_STATE[user_id]
-
-
-async def openai_answer(history):
-    """
-    history — список сообщений формата:
-      [{"role":"system"|"user"|"assistant", "content":"..."}]
-    Возвращает str — ответ ассистента.
-    """
-    # Безопасный системный промпт в духе AILVI
-    system_prompt = (
-        "Ты — AILVI: мягкий, ясный духовный проводник. Помогаешь человеку распаковать сильные стороны, "
-        "ценности и сделать маленькие осмысленные шаги. Избегай коуч-клише и пустых обещаний. "
-        "Говори коротко и по делу, тепло и уважительно. Если человек говорит об Исламе — "
-        "поддерживай уважительно, без фетв и категоричных суждений."
-    )
-
-    # Собираем историю: системное сообщение + последние реплики пользователя/ассистента
-    messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(history[-10:])  # последние 10 – достаточно для контекста на старте
-
-    try:
-        # Chat Completions
-        resp = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            temperature=0.6,
-            max_tokens=600,  # ограничим разумно
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        # Специальная обработка квоты
-        msg = str(e)
-        if "insufficient_quota" in msg or "You exceeded your current quota" in msg:
-            logger.error("OpenAI quota error: %s", msg)
-            return (
-                "Похоже, исчерпан лимит на ответы ИИ. Я скоро вернусь. "
-                "Если нужно срочно — напиши одно короткое уточнение, постараюсь ответить максимально кратко."
-            )
-        logger.exception("OpenAI error")
-        return "Сейчас у меня техническая заминка. Давай попробуем ещё раз через минуту."
-
-
-# --------------------------- Handlers --------------------------- #
-
+# -----------------------------
+# Хэндлеры
+# -----------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    USER_STATE[user_id] = {"count": 0, "history": []}  # жёсткий сброс
-    await update.message.reply_text(WELCOME_TEXT)
+    """Приветствие с кнопкой «Начать»."""
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🚀 Начать", callback_data="start_flow")]]
+    )
+    if update.message:
+        await update.message.reply_text(GREETING, reply_markup=keyboard)
+    elif update.callback_query:
+        await update.callback_query.message.reply_text(GREETING, reply_markup=keyboard)
+
+
+async def handle_start_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Нажатие на кнопку «Начать»: убираем клавиши и даём первый вопрос."""
+    query = update.callback_query
+    await query.answer()
+    # убираем кнопки под приветствием
+    try:
+        await query.edit_message_reply_markup(None)
+    except Exception:
+        pass
+
+    first_q = (
+        "Начинаем. Расскажи, пожалуйста, о 1–2 моментах в твоей жизни, когда ты чувствовал(а) наибольшую живость и смысл: "
+        "что это было, что ты делал(а), с кем, почему это наполнило тебя?"
+    )
+    await query.message.reply_text(first_q)
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    USER_STATE[user_id] = {"count": 0, "history": []}
-    await update.message.reply_text("Сессию очистил. Напиши, с чего начнём.")
-    await update.message.reply_text(WELCOME_TEXT)
+    """Простой «сброс» — фактически просто ещё раз показываем приветствие с кнопкой."""
+    await start(update, context)
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def reply_with_openai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Основной ответ через OpenAI на любое обычное сообщение."""
     if not update.message or not update.message.text:
         return
 
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-    state = get_user_state(user_id)
-
-    # учтём /start как обычный текст – тут ничего не делаем, им занимается start()
-    if text.startswith("/"):
-        return
-
-    # Инкремент считаем только за содержательные сообщения
-    state["count"] += 1
-    # Пишем в историю
-    state["history"].append({"role": "user", "content": text})
-
-    # Порог бесплатных сообщений
-    if state["count"] > FREE_MESSAGE_LIMIT:
-        # Дадим мягкое сообщение-приглашение
-        await update.message.reply_text(PAYWALL_TEXT)
-        # Разрешим ещё 1-2 ответа «поверх порога», но сейчас просто останавливаемся
-        return
-
-    # Основной ответ OpenAI
-    answer = await openai_answer(state["history"])
-    # Пишем ответ в историю
-    state["history"].append({"role": "assistant", "content": answer})
-    await update.message.reply_text(answer)
+    user_text = update.message.text.strip()
+    try:
+        # компактная, быстрая и недорогая модель
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_text},
+            ],
+            temperature=0.6,
+        )
+        answer = response.choices[0].message.content or "..."
+        await update.message.reply_text(answer)
+    except Exception as e:
+        logger.exception("OpenAI error")
+        await update.message.reply_text(
+            "Извини, сейчас не получается ответить. Попробуй ещё раз чуть позже."
+        )
 
 
-# --------------------------- Health-check HTTP --------------------------- #
-# Render любит, когда что-то слушает порт (health checks). Лёгкий HTTP-сервер.
+async def post_init(app):
+    """Удаляем webHook (на всякий случай) и ставим команды меню."""
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=False)
+    except Exception:
+        pass
 
-class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-def start_health_server():
-    port = int(os.getenv("PORT", "10000"))
-    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
-    logger.info(f"Health server on port {port}")
-    server.serve_forever()
+    await app.bot.set_my_commands(
+        [
+            BotCommand("start", "Показать приветствие"),
+            BotCommand("reset", "Перезапустить приветствие"),
+        ]
+    )
 
 
-# --------------------------- Запуск --------------------------- #
+# -----------------------------
+# Health-check для Render
+# -----------------------------
+flask_app = Flask(__name__)
 
-def run_telegram_bot():
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+@flask_app.get("/")
+def health():
+    return "OK", 200
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+def run_health_server():
+    port = int(os.getenv("PORT", "10000"))  # Render обычно ждёт порт из $PORT
+    flask_app.run(host="0.0.0.0", port=port)
 
-    # В PTB v21 run_polling() — coroutine, его нужно запускать через asyncio.run
-    asyncio.run(app.run_polling(
-        allowed_updates=Update.ALL_TYPES  # безопасно
-    ))
+
+# -----------------------------
+# Точка входа
+# -----------------------------
+def main():
+    # поднимаем health-сервер в отдельном потоке
+    threading.Thread(target=run_health_server, daemon=True).start()
+
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    application.post_init = post_init
+
+    # хэндлеры
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("reset", reset))
+    application.add_handler(CallbackQueryHandler(handle_start_flow, pattern="^start_flow$"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply_with_openai))
+
+    # запуск polling
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    # 1) Фоновый health-сервер
-    threading.Thread(target=start_health_server, daemon=True).start()
-
-    # 2) Телеграм-бот (polling)
-    run_telegram_bot()
+    main()
