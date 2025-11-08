@@ -1,69 +1,65 @@
 import os
+import asyncio
+import httpx
 from flask import Flask, request
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from openai import OpenAI
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# ---- Env ----
+OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-WEBHOOK_BASE = os.getenv("WEBHOOK_BASE")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+WEBHOOK_BASE     = os.getenv("WEBHOOK_BASE")      # например: https://ailvi-bot.onrender.com
+WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET")    # например: ailvi_secret_123
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-app = Flask(__name__)
+# ---- Telegram application (без polling) ----
+application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-# ----------------------------
-# ✅ Обработка Telegram webhook
-# ----------------------------
-@app.post(f"/{WEBHOOK_SECRET}")
-async def webhook():
-    data = request.json
-    update = Update.de_json(data, application.bot)
-    await application.process_update(update)
-    return "ok"
+async def start(update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Ассаламу Алейкум. Я рядом и веду тебя шаг за шагом.")
 
-
-# ----------------------------
-# ✅ Команды и сообщения
-# ----------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Ассаламу Алейкум. Я рядом, и я буду вести тебя шаг за шагом.")
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
-
-    response = client.chat.completions.create(
+    resp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": "Ты — мягкий проводник AILVI. Ты задаёшь вопросы, раскрываешь человека, а не отвечаешь вместо него."},
-            {"role": "user", "content": user_text}
-        ]
+            {"role": "system", "content": "Ты — мягкий проводник AILVI. Задаёшь вопросы и раскрываешь человека."},
+            {"role": "user", "content": user_text},
+        ],
     )
-    answer = response.choices[0].message["content"]
+    answer = resp.choices[0].message["content"]
     await update.message.reply_text(answer)
 
-
-# ----------------------------
-# ✅ Запуск Telegram приложения
-# ----------------------------
-application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 application.add_handler(CommandHandler("start", start))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+# ---- Flask ----
+app = Flask(__name__)
 
-# ----------------------------
-# ✅ Установка webhook при старте
-# ----------------------------
-@app.before_first_request
-def setup_webhook():
+@app.post(f"/{WEBHOOK_SECRET}")
+def webhook():
+    """Синхронный Flask-роут, внутри запускаем async-обработку."""
+    data = request.get_json(force=True, silent=True) or {}
+    update = Update.de_json(data, application.bot)
+    asyncio.run(application.process_update(update))
+    return "ok"
+
+@app.get("/")
+def health():
+    return "AILVI bot is alive"
+
+def set_webhook():
+    """Ставим вебхук через Telegram API (надёжно и просто)."""
     url = f"{WEBHOOK_BASE}/{WEBHOOK_SECRET}"
-    print("Setting webhook to:", url)
-    application.bot.set_webhook(url)
+    api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
+    with httpx.Client(timeout=10.0) as x:
+        r = x.post(api, json={"url": url})
+        print("SetWebhook status:", r.status_code, r.text)
 
-
-# ----------------------------
-# ✅ Запуск Flask сервера
-# ----------------------------
 if __name__ == "__main__":
+    # 1) Перед запуском сервера ставим вебхук
+    set_webhook()
+    # 2) Запускаем Flask на Render-порту 10000
     app.run(host="0.0.0.0", port=10000)
