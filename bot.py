@@ -1,46 +1,70 @@
-import logging
-from telegram import Update
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
-import openai
+import os
+import threading
+from flask import Flask
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters
+from openai import OpenAI
 
-TELEGRAM_TOKEN = "ТВОЙ_ТОКЕН"
-OPENAI_API_KEY = "ТВОЙ_API_KEY"
+# -------------------------
+# 🔑 API ключи
+# -------------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-openai.api_key = OPENAI_API_KEY
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# -------------------------
+# ✅ Flask health-check
+# -------------------------
+app = Flask(__name__)
 
-def start(update: Update, context: CallbackContext):
-    update.message.reply_text(
-        "Ассаляму Алейкум уа РахматуЛлахи уа Баракятух! 👋🏻\n\n"
-        "Добро пожаловать в пространство, где Сердце узнаёт себя заново.\n\n"
-        "Чтобы начать — просто напиши любое слово."
+@app.route("/")
+def home():
+    return "AILVI bot is alive"
+
+def run_flask():
+    app.run(host="0.0.0.0", port=10000)
+
+# -------------------------
+# ✅ Telegram logic
+# -------------------------
+
+async def handle_message(update, context):
+    user_text = update.message.text
+
+    # Создаём диалог с GPT
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "Ты — мягкий, спокойный и добрый проводник AILVI. Ты помогаешь человеку распаковывать личность шаг за шагом, задаёшь вопросы, мягко направляешь и не отвечаешь за него."},
+            {"role": "user", "content": user_text}
+        ]
     )
 
-def chat(update: Update, context: CallbackContext):
-    user_msg = update.message.text
+    answer = response.choices[0].message["content"]
+    await update.message.reply_text(answer)
 
-    response = openai.Completion.create(
-        model="gpt-3.5-turbo-instruct",
-        prompt=user_msg,
-        max_tokens=200
-    )
+async def start(update, context):
+    await update.message.reply_text("Ассаламу Алейкум. Я готов работать с тобой.")
 
-    answer = response["choices"][0]["text"].strip()
-    update.message.reply_text(answer)
 
-def main():
-    updater = Updater(TELEGRAM_TOKEN, use_context=True)
-    dp = updater.dispatcher
+def run_telegram():
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, chat))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    updater.start_polling()
-    updater.idle()
+    print("✅ Telegram polling started")
+    application.run_polling()
 
+
+# -------------------------
+# ✅ Main section
+# -------------------------
 if __name__ == "__main__":
-    main()
+    # Запускаем Flask в отдельном потоке
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+
+    # Запускаем Telegram бота
+    run_telegram()
