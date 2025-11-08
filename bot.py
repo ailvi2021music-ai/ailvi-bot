@@ -1,65 +1,129 @@
+# bot.py
 import os
-import asyncio
-import httpx
-from flask import Flask, request
+import threading
+import logging
+from flask import Flask
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    ContextTypes,
+    CommandHandler,
+    MessageHandler,
+    filters,
+)
 from openai import OpenAI
 
-# ---- Env ----
-OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY")
+# -------------------------
+# 🔧 Логи
+# -------------------------
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("ailvi-bot")
+
+# -------------------------
+# 🔑 Переменные окружения
+# -------------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-WEBHOOK_BASE     = os.getenv("WEBHOOK_BASE")      # например: https://ailvi-bot.onrender.com
-WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET")    # например: ailvi_secret_123
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY не найден в переменных окружения")
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN не найден в переменных окружения")
 
-# ---- Telegram application (без polling) ----
-application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+# ВАЖНО: новый SDK берёт ключ из окружения, параметр api_key передавать не нужно
+client = OpenAI()
 
-async def start(update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Ассаламу Алейкум. Я рядом и веду тебя шаг за шагом.")
-
-async def handle_message(update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "Ты — мягкий проводник AILVI. Задаёшь вопросы и раскрываешь человека."},
-            {"role": "user", "content": user_text},
-        ],
-    )
-    answer = resp.choices[0].message["content"]
-    await update.message.reply_text(answer)
-
-application.add_handler(CommandHandler("start", start))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-# ---- Flask ----
+# -------------------------
+# ✅ Health-check (Render)
+# -------------------------
 app = Flask(__name__)
 
-@app.post(f"/{WEBHOOK_SECRET}")
-def webhook():
-    """Синхронный Flask-роут, внутри запускаем async-обработку."""
-    data = request.get_json(force=True, silent=True) or {}
-    update = Update.de_json(data, application.bot)
-    asyncio.run(application.process_update(update))
-    return "ok"
-
-@app.get("/")
-def health():
+@app.route("/")
+def home():
     return "AILVI bot is alive"
 
-def set_webhook():
-    """Ставим вебхук через Telegram API (надёжно и просто)."""
-    url = f"{WEBHOOK_BASE}/{WEBHOOK_SECRET}"
-    api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
-    with httpx.Client(timeout=10.0) as x:
-        r = x.post(api, json={"url": url})
-        print("SetWebhook status:", r.status_code, r.text)
-
-if __name__ == "__main__":
-    # 1) Перед запуском сервера ставим вебхук
-    set_webhook()
-    # 2) Запускаем Flask на Render-порту 10000
+def run_flask():
+    # Render смотрит порт 10000
     app.run(host="0.0.0.0", port=10000)
+
+# -------------------------
+# 🤖 Telegram-логика
+# -------------------------
+
+# post_init вызывается ПЕРЕД стартом polling:
+# удаляем webhook и сбрасываем «висящие» апдейты,
+# чтобы не было конфликтов "other getUpdates request"
+async def post_init(application):
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        log.info("Webhook удалён, pending updates сброшены")
+    except Exception as e:
+        log.warning("Не удалось удалить webhook: %s", e)
+
+ASYNC_SYSTEM_PROMPT = (
+    "Ты — мягкий, спокойный и добрый проводник AILVI. "
+    "Помогаешь человеку распаковывать личность шаг за шагом, задаёшь уточняющие вопросы, "
+    "бережно направляешь и не придумываешь ответы за человека."
+)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Ассаламу Алейкум. Я готов работать с тобой."
+    )
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    user_text = update.message.text.strip()
+
+    try:
+        # Новый SDK: chat.completions.create
+        completion = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": ASYNC_SYSTEM_PROMPT},
+                {"role": "user", "content": user_text},
+            ],
+            temperature=0.5,
+        )
+        # ВАЖНО: теперь доступ к тексту так:
+        answer = completion.choices[0].message.content
+        if not answer:
+            answer = "Мне сложно сформулировать ответ. Скажи, пожалуйста, иначе."
+        await update.message.reply_text(answer)
+
+    except Exception as e:
+        log.exception("Ошибка OpenAI: %s", e)
+        await update.message.reply_text(
+            "Похоже, возникла техническая пауза. Попробуй написать ещё раз через минуту."
+        )
+
+def run_telegram():
+    application = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)  # удалим webhook перед polling
+        .build()
+    )
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    log.info("✅ Telegram polling started")
+    # drop_pending_updates=True ещё раз на всякий случай
+    application.run_polling(close_loop=False, drop_pending_updates=True)
+
+# -------------------------
+# 🚀 Main
+# -------------------------
+if __name__ == "__main__":
+    # 1) поднимаем health-check сервер (Render ждёт ответ на порт 10000)
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    # 2) запускаем Telegram-бота (polling)
+    run_telegram()
