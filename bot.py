@@ -1,219 +1,82 @@
 import os
-import json
 import threading
-import logging
-from flask import Flask
+import asyncio
+from flask import Flask, request
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    ContextTypes, filters
-)
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters
 from openai import OpenAI
 
-# -------------------------
-# 🔧 Логи
-# -------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("ailvi-live")
-
-# -------------------------
-# 🔑 Ключи
-# -------------------------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# ----- ENV -----
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# URL твоего сервиса на Render, без слеша в конце. Пример: https://ailvi-bot.onrender.com
+WEBHOOK_BASE = os.getenv("WEBHOOK_BASE")  
+# Секретный путь вебхука: сделай случайную строку (например, 24 символа)
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "supersecret_path_123")
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# -------------------------
-# ✅ Flask health-check
-# -------------------------
+# ----- Flask (health + webhook) -----
 app = Flask(__name__)
 
-@app.route("/")
-def home():
-    return "AILVI live-unpack is alive"
+@app.get("/")
+def health():
+    return "AILVI bot is alive"
+
+# Этот маршрут принимает апдейты от Telegram
+@app.post(f"/{WEBHOOK_SECRET}")
+def telegram_webhook():
+    data = request.get_json(force=True)
+    update = Update.de_json(data, application.bot)
+    # Отдаём апдейт циклу PTB (он асинхронный)
+    asyncio.run_coroutine_threadsafe(application.process_update(update), application.loop)
+    return "ok"
 
 def run_flask():
+    # Render слушает 10000 порт на free инстансе
     app.run(host="0.0.0.0", port=10000)
 
-# -------------------------
-# 🧭 21 «маяк» (этапы) — ориентиры курса
-# (это НЕ жёсткий сценарий; диалог адаптивный)
-# -------------------------
-MILESTONES = [
-    "Намерение и рамка. Зачем тебе распаковка? Какие решения ждут ответа? Старт дневника наблюдений.",                       # 1
-    "3 эпизода «когда я был(а) живым(ой)»: контекст → что делал(а) → с кем → почему «горело».",                               # 2
-    "Карта ценностей (card-sort): 20–30 ценностей — «очень важно / важно / вторично / не моё».",                           # 3
-    "Энергия / Дренаж: списки задач/людей/ритмов, которые заряжают и высасывают.",                                         # 4
-    "Поток: в каких обстоятельствах теряешь счёт времени? Условия потока (сложность, автономия, обратная связь).",         # 5
-    "Внешний взгляд (RBS): 3 истории от людей, где ты был(а) на высоте (ситуация → чем помог(ла) → эффект).",              # 6
-    "Суммируем факты (без выводов): 1 страница «что я наблюдаю про себя».",                                                # 7
-    "Черты поведения (Big Five — IPIP): экстраверсия, доброжелательность, добросовестность, стабильность, открытость.",    # 8
-    "Сильные стороны (VIA): назови топ-5 через реальные действия (напр. «любознательность → я еженедельно…»).",             # 9
-    "Интересы (RIASEC): 2–3 доминирующих кластера и реальные форматы (R/I/A/S/E/C).",                                      # 10
-    "Навыки и «Т-профиль»: вертикаль (глубина) + горизонталь (переносимые навыки).",                                        # 11
-    "Среда раскрытия: нужный «климат» (автономия/команда, стабильность/проекты, тишина/движение, цифры/люди, камера/бек).", # 12
-    "Естественные роли: 2–3 (напр. «созерцатель-рассказчик», «мастер ремесла», «сборщик смыслов», «наставник»).",           # 13
-    "Гипотезы о призвании: 3 формулы «Я силён в ___, люблю ___, миру нужно ___».",                                         # 14
-    "Идеи микро-экспериментов (2–3): гипотеза → MVP → метрика → срок 7–10 дней → риски/границы.",                           # 15
-    "Дизайн среды под эксперимент: когда/где/с кем/какая обратная связь.",                                                  # 16
-    "Запуск первой пробы: малый шаг сегодня (≤60 минут).",                                                                  # 17
-    "Лог наблюдений: что получилось? энергия после? отзыв от одного человека?",                                             # 18
-    "Корректировка: усили «что работает», убери лишнее, дай вторую попытку.",                                               # 19
-    "Вторая проба или мини-питч (если публично): открытый тест с обратной связью.",                                         # 20
-    "Личная стратегия (1 лист): миссия; сильные стороны; среда/формат; роли и продукты; план 30–90 дней; маркеры пути."     # 21
-]
+# ----- Telegram handlers -----
+async def start(update, context):
+    await update.message.reply_text("Ассаламу Алейкум. Я готов работать с тобой.")
 
-# -------------------------
-# 🧠 System prompt — живая распаковка + научные опоры
-# -------------------------
-SYSTEM_PROMPT = (
-    "Ты — AILVI Guide. Ведёшь ЖИВУЮ распаковку личности: каждый следующий вопрос рождается из ответа пользователя. "
-    "Опираешься на поведенческие данные и реальные истории; используешь научные опоры (IPIP/Big Five, VIA, RIASEC, "
-    "Reflected Best Self, карта потока, Т-профиль, микро-эксперименты). "
-    "Твоя задача — задавать РОВНО ОДИН короткий вопрос за раз, мягко и конкретно, без лекций и выводов за человека. "
-    "Держи исламский контекст намерения (амана, халяль-рамки), но не цитируй ничего, если пользователь сам не запроcил. "
-    "Ты ведёшь по этапам-маякам (список из 21 пункта ниже), но можешь адаптивно двигаться вперёд/назад по мере готовности. "
-    "Отвечай ТОЛЬКО JSON без преамбул:\n"
-    "{"
-    "\"next_prompt\":\"короткий следующий вопрос\","
-    "\"milestone_index\":int, "
-    "\"milestone_title\":\"название маяка\","
-    "\"state_note\":\"сжатая служебная заметка о том, что выяснили/куда идти дальше (до 400 символов)\""
-    "}\n"
-    "Правила: если ответ расплывчатый — уточни конкретнее; если зрелый — предложи более глубокий под-шаг того же маяка "
-    "или мягкий переход к следующему. Всегда один вопрос — один шаг. Пиши на русском, бережно и просто."
-)
+async def handle_message(update, context):
+    user_text = update.message.text
 
-INTRO_TEXT = (
-    "Ассаляму Алейкум. Я буду вести тебя шаг за шагом — мягко и без спешки. "
-    "Пиши искренне и кратко. Начнём."
-)
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "Ты — мягкий, спокойный и добрый проводник AILVI. Помогаешь распаковывать личность, задаёшь уточняющие вопросы и не отвечаешь за человека."},
+            {"role": "user", "content": user_text}
+        ]
+    )
+    # openai-python v1: контент находится здесь:
+    answer = resp.choices[0].message.content
+    await update.message.reply_text(answer)
 
-FINISH_HINT = (
-    "Когда почувствуешь, что картина сложилась, я помогу собрать всё в один лист личной стратегии."
-)
+# Создаём приложение PTB (без polling)
+application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+application.add_handler(CommandHandler("start", start))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-# -------------------------
-# 🔎 helpers
-# -------------------------
-def milestone_title(i: int) -> str:
-    i = max(0, min(len(MILESTONES) - 1, i))
-    return MILESTONES[i]
+async def init_telegram():
+    # Инициализируем PTB и ставим webhook
+    await application.initialize()
+    await application.start()
+    # Сбрасываем хвосты и ставим новый вебхук
+    await application.bot.set_webhook(
+        url=f"{WEBHOOK_BASE}/{WEBHOOK_SECRET}",
+        drop_pending_updates=True,
+        allowed_updates=["message"]  # экономим трафик, если нужны только сообщения
+    )
 
-def get_engine_state(ctx: ContextTypes.DEFAULT_TYPE) -> dict:
-    return ctx.user_data.get("engine", {"milestone_index": 0, "state_note": ""})
-
-def set_engine_state(ctx: ContextTypes.DEFAULT_TYPE, state: dict):
-    ctx.user_data["engine"] = state
-
-def ask_model(user_payload: dict) -> dict:
-    """
-    Вызывает модель и возвращает dict с ключами:
-    next_prompt, milestone_index, milestone_title, state_note.
-    Гарантирует безопасные дефолты при любой ошибке/невалидном JSON.
-    """
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT + "\n\nМАЯКИ:\n" + "\n".join(f"{i+1}. {t}" for i, t in enumerate(MILESTONES))},
-                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)}
-            ],
-            temperature=0.4,
-            max_tokens=500
-        )
-        raw = resp.choices[0].message.content if resp.choices else ""
-        data = json.loads(raw) if raw else {}
-    except Exception as e:
-        log.exception("ask_model error:")
-        data = {}
-
-    # Безопасные дефолты
-    mi = int(data.get("milestone_index", user_payload.get("current_milestone_index", 0)))
-    title = data.get("milestone_title") or milestone_title(mi)
-    nprompt = data.get("next_prompt") or "Сформулируй коротко своё намерение на ближайший этап."
-    snote = (data.get("state_note") or "").strip()[:400]
-    return {
-        "milestone_index": max(0, min(len(MILESTONES) - 1, mi)),
-        "milestone_title": title,
-        "next_prompt": nprompt,
-        "state_note": snote
-    }
-
-# -------------------------
-# 🤖 Handlers
-# -------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Сброс состояния и мягкое вступление
-    set_engine_state(context, {"milestone_index": 0, "state_note": ""})
-    await update.message.reply_text(INTRO_TEXT)
-
-    # Первый шаг — намерение и рамка
-    seed = {
-        "user_message": "Хочу начать распаковку. Помоги обозначить намерение и рамку.",
-        "current_milestone_index": 0,
-        "current_milestone_title": milestone_title(0),
-        "state_note": ""
-    }
-    data = ask_model(seed)
-
-    # Показать текущий маяк один раз в начале
-    await update.message.reply_text(f"🧭 Этап: {data['milestone_title']}")
-    await update.message.reply_text(data["next_prompt"])
-    # Сохранить состояние
-    set_engine_state(context, {
-        "milestone_index": data["milestone_index"],
-        "state_note": data["state_note"]
-    })
-
-async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-
-    user_text = update.message.text.strip()
-    eng = get_engine_state(context)
-    idx = int(eng.get("milestone_index", 0))
-    note = eng.get("state_note", "")
-
-    # Передаём в модель текущий контекст и новый ответ пользователя
-    payload = {
-        "user_message": user_text,
-        "current_milestone_index": idx,
-        "current_milestone_title": milestone_title(idx),
-        "state_note": note
-    }
-    data = ask_model(payload)
-
-    # Если произошёл переход на другой «день-маяк» — мягко подсветить
-    if data["milestone_index"] != idx:
-        await update.message.reply_text(f"🧭 Этап: {data['milestone_title']}")
-
-    # Следующий короткий шаг
-    await update.message.reply_text(data["next_prompt"])
-
-    # Обновить состояние
-    set_engine_state(context, {
-        "milestone_index": data["milestone_index"],
-        "state_note": data["state_note"] or note
-    })
-
-# -------------------------
-# 🚀 Runner
-# -------------------------
-def run_telegram():
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
-    log.info("✅ Telegram polling started")
-    app.run_polling()
-
-# -------------------------
-# ✅ Main
-# -------------------------
 if __name__ == "__main__":
+    # 1) Запускаем Telegram-часть (инициализация + webhook)
+    asyncio.run(init_telegram())
+
+    # 2) Поднимаем Flask (HTTP-сервер для вебхука и health)
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    try:
-        run_telegram()
-    except Exception as e:
-        log.exception("startup error:")
+
+    # 3) Держим главный поток живым
+    flask_thread.join()
