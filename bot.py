@@ -1,59 +1,97 @@
+# bot.py
 import os
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-from openai import OpenAI
+import logging
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
-WELCOME = (
+SYSTEM_PROMPT = (
+    "You are AILVI — a gentle, practical guide who помогает человеку распаковать "
+    "сильные стороны и наметить пути заработка на них. Отвечай коротко, по делу, "
+    "бережно и ясно."
+)
+
+WELCOME_TEXT = (
     "Ассаляму Алейкум уа РахматуЛлахи уа Баракятух! 👋🏻\n\n"
     "Добро пожаловать в пространство, где Сердце узнаёт себя заново.\n\n"
-    "Давай вместе, спокойно, шаг за шагом откроем драгоценные дары, которые Аллах уже вложил в твою Душу — "
-    "силы, таланты, намерения, которые ждут, когда ты увидишь их Свет. 💎\n\n"
-    "Пусть Аллах сделает этот путь лёгким, благословенным и наполненным пониманием!\n\n"
-    "Чтобы начать, просто напиши мне любую фразу."
+    "Спокойно и шаг за шагом откроем дары, которые Аллах уже вложил в твою Душу — "
+    "силы, таланты, намерения. 💎\n\n"
+    "Чтобы начать — просто напиши мне любое сообщение."
 )
 
-SYSTEM = (
-    "Ты — AILVI, мягкий и точный наставник. Распаковываешь сильные стороны человека, его таланты и ценности. "
-    "Говоришь простым русским языком, спокойно и по делу, без водянистости. "
-    "Избегаешь спорных тем, бережно направляешь к ясности и конкретным шагам."
-)
+def start(update, context):
+    update.message.reply_text(WELCOME_TEXT)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(WELCOME)
+def _ask_openai(user_text: str) -> str:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return "⚠️ Не найден OPENAI_API_KEY в переменных окружения."
 
-def ask_gpt(user_text: str) -> str:
-    # Короткий ответ GPT-5 (или другой выбранной модели)
-    resp = client.chat.completions.create(
-        model="gpt-5",  # можно заменить на более дешёвую, например gpt-4.1-mini
-        messages=[
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": user_text}
-        ],
-        temperature=0.6,
-        max_tokens=500
-    )
-    return resp.choices[0].message.content.strip()
-
-async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = (update.message.text or "").strip()
-    if not user_text:
-        return
+    # Пытаемся работать и с новым SDK, и со старым — что установлено, тем и пользуемся.
     try:
-        answer = ask_gpt(user_text)
+        try:
+            # Новый SDK (openai>=1.x)
+            from openai import OpenAI
+            client = OpenAI(api_key=api_key)
+            resp = client.chat.completions.create(
+                model="gpt-5-chat-latest",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_text},
+                ],
+                temperature=0.7,
+                max_tokens=400,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception:
+            # Старый SDK (openai<=0.28)
+            import openai  # type: ignore
+            openai.api_key = api_key
+            resp = openai.ChatCompletion.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_text},
+                ],
+                temperature=0.7,
+                max_tokens=400,
+            )
+            return resp.choices[0].message["content"].strip()
     except Exception as e:
-        answer = "Сейчас мне трудно ответить технически. Попробуй повторить запрос чуть позже."
-    await update.message.reply_text(answer)
+        logger.exception("OpenAI error")
+        return f"⚠️ Ошибка OpenAI: {e}"
+
+def on_text(update, context):
+    user_text = update.message.text or ""
+    reply = _ask_openai(user_text)
+    update.message.reply_text(reply)
 
 def main():
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
-    app.run_polling(close_loop=False)
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        logger.error("TELEGRAM_BOT_TOKEN не найден в переменных окружения.")
+        return
+
+    # v13 синхронный Updater
+    updater = Updater(token, use_context=True)
+    dp = updater.dispatcher
+
+    # Гарантируем чистый polling (без webhooks и «вторых» экземпляров)
+    try:
+        updater.bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, on_text))
+
+    updater.start_polling(clean=True)
+    updater.idle()
 
 if __name__ == "__main__":
     main()
