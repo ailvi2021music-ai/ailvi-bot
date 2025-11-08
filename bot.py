@@ -1,19 +1,20 @@
 import os
+import time
 import threading
 from flask import Flask
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters
 from openai import OpenAI
+from telegram.error import Conflict
 
 # -------------------------
 # 🔑 Ключи
 # -------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # -------------------------
-# ✅ Flask health-check
+# ✅ Flask health-check (без reloader!)
 # -------------------------
 app = Flask(__name__)
 
@@ -22,7 +23,6 @@ def home():
     return "AILVI bot is alive"
 
 def run_flask():
-    # ВАЖНО: запрещаем reloader, чтобы процесс не запускался повторно
     app.run(host="0.0.0.0", port=10000, debug=False, use_reloader=False, threaded=True)
 
 # -------------------------
@@ -42,8 +42,7 @@ async def start(update, context):
 
 async def handle_message(update, context):
     user_text = update.message.text
-
-    response = client.chat.completions.create(
+    resp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {
@@ -57,24 +56,40 @@ async def handle_message(update, context):
             {"role": "user", "content": user_text},
         ],
     )
-    # openai==1.3.7 возвращает dict в .message
-    answer = response.choices[0].message["content"]
+    answer = resp.choices[0].message["content"]
     await update.message.reply_text(answer)
 
-def run_telegram():
+def build_app():
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("✅ Telegram polling started")
-    application.run_polling()
+    return application
+
+def run_telegram():
+    """Единичный запуск polling + жёсткая защита от 409-конфликта."""
+    while True:
+        try:
+            app_tg = build_app()
+            # На старте гарантированно убираем возможный webhook
+            # и сбрасываем очередь апдейтов.
+            app_tg.run_polling(
+                drop_pending_updates=True,
+                allowed_updates=None,   # все типы
+                stop_signals=None       # управляем сами, без двойных сигналов
+            )
+            break  # нормально завершили
+        except Conflict:
+            # Короткая перекрывашка при деплое/рестарте — подождём и повторим.
+            print("⚠️ Detected 409 Conflict (another getUpdates). Retrying in 3s...")
+            time.sleep(3)
+        except Exception as e:
+            print(f"⚠️ Unexpected error in polling: {e}. Retrying in 3s...")
+            time.sleep(3)
 
 # -------------------------
 # ✅ Main
 # -------------------------
 if __name__ == "__main__":
-    # Запускаем Flask в отдельном потоке
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-
-    # Запускаем Telegram бота (единожды)
+    th = threading.Thread(target=run_flask, daemon=True)
+    th.start()
     run_telegram()
