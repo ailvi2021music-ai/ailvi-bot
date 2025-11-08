@@ -1,18 +1,24 @@
 import os
-from telegram.ext import Updater, MessageHandler, Filters, CommandHandler
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    MessageHandler,
+    CommandHandler,
+    ContextTypes,
+    filters
+)
 from openai import OpenAI
 
-# Загружаем токены из переменных окружения Render
+# Токены
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Инициализация клиента OpenAI
+# GPT-клиент
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Счётчики сообщений пользователей
+# Счётчики сообщений
 user_message_count = {}
 
-# Приветственный текст
 WELCOME_TEXT = (
     "Ассаляму Алейкум уа РахматуЛлахи уа Баракятух! 👋🏻\n\n"
     "Добро пожаловать в пространство, где Сердце узнаёт себя заново.\n\n"
@@ -22,29 +28,29 @@ WELCOME_TEXT = (
     "Чтобы начать — просто напиши любое слово. Я рядом."
 )
 
-# Команда /start
-def start(update, context):
-    chat_id = update.message.chat_id
+# /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     user_message_count[chat_id] = 0
-    update.message.reply_text(WELCOME_TEXT)
+    await update.message.reply_text(WELCOME_TEXT)
 
-# Обработка всех текстовых сообщений
-def handle_message(update, context):
-    chat_id = update.message.chat_id
+# Обработка сообщений
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     text = update.message.text
 
-    # Увеличиваем счётчик сообщений
+    # Увеличиваем счётчик
     user_message_count[chat_id] = user_message_count.get(chat_id, 0) + 1
 
-    # GPT-5 ответ
+    # Запрос к GPT-5
     completion = client.chat.completions.create(
         model="gpt-5",
         messages=[
             {
                 "role": "system",
                 "content": (
-                    "Ты — мягкий наставник в стиле AILVI: вдохновляющий, спокойный, глубоко "
-                    "понимающий человека, говорящий сердцем и ведя к раскрытию внутреннего дара."
+                    "Ты — мягкий наставник в стиле AILVI: вдохновляющий, спокойный, "
+                    "сердечный проводник к внутренней глубине человека."
                 )
             },
             {"role": "user", "content": text}
@@ -52,21 +58,17 @@ def handle_message(update, context):
     )
 
     reply = completion.choices[0].message.content
-    update.message.reply_text(reply)
+    await update.message.reply_text(reply)
 
-# Главная функция
-def main():
-    updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
+# Запуск polling
+async def main():
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # обработчики
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # запуск long-polling
-    updater.start_polling()
-    updater.idle()
+    await app.run_polling()
 
-# Запуск
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
