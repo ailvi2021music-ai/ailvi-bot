@@ -1,74 +1,59 @@
 import os
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    MessageHandler,
-    CommandHandler,
-    ContextTypes,
-    filters
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from openai import OpenAI
 
-# Токены
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# GPT-клиент
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Счётчики сообщений
-user_message_count = {}
-
-WELCOME_TEXT = (
+WELCOME = (
     "Ассаляму Алейкум уа РахматуЛлахи уа Баракятух! 👋🏻\n\n"
     "Добро пожаловать в пространство, где Сердце узнаёт себя заново.\n\n"
-    "Давай вместе, спокойно, шаг за шагом откроем драгоценные дары, которые Аллах уже вложил "
-    "в твою Душу — силы, таланты, намерения, которые ждут, когда ты увидишь их Свет. 💎\n\n"
+    "Давай вместе, спокойно, шаг за шагом откроем драгоценные дары, которые Аллах уже вложил в твою Душу — "
+    "силы, таланты, намерения, которые ждут, когда ты увидишь их Свет. 💎\n\n"
     "Пусть Аллах сделает этот путь лёгким, благословенным и наполненным пониманием!\n\n"
-    "Чтобы начать — просто напиши любое слово. Я рядом."
+    "Чтобы начать, просто напиши мне любую фразу."
 )
 
-# /start
+SYSTEM = (
+    "Ты — AILVI, мягкий и точный наставник. Распаковываешь сильные стороны человека, его таланты и ценности. "
+    "Говоришь простым русским языком, спокойно и по делу, без водянистости. "
+    "Избегаешь спорных тем, бережно направляешь к ясности и конкретным шагам."
+)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user_message_count[chat_id] = 0
-    await update.message.reply_text(WELCOME_TEXT)
+    await update.message.reply_text(WELCOME)
 
-# Обработка сообщений
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    text = update.message.text
-
-    # Увеличиваем счётчик
-    user_message_count[chat_id] = user_message_count.get(chat_id, 0) + 1
-
-    # Запрос к GPT-5
-    completion = client.chat.completions.create(
-        model="gpt-5",
+def ask_gpt(user_text: str) -> str:
+    # Короткий ответ GPT-5 (или другой выбранной модели)
+    resp = client.chat.completions.create(
+        model="gpt-5",  # можно заменить на более дешёвую, например gpt-4.1-mini
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Ты — мягкий наставник в стиле AILVI: вдохновляющий, спокойный, "
-                    "сердечный проводник к внутренней глубине человека."
-                )
-            },
-            {"role": "user", "content": text}
-        ]
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": user_text}
+        ],
+        temperature=0.6,
+        max_tokens=500
     )
+    return resp.choices[0].message.content.strip()
 
-    reply = completion.choices[0].message.content
-    await update.message.reply_text(reply)
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = (update.message.text or "").strip()
+    if not user_text:
+        return
+    try:
+        answer = ask_gpt(user_text)
+    except Exception as e:
+        answer = "Сейчас мне трудно ответить технически. Попробуй повторить запрос чуть позже."
+    await update.message.reply_text(answer)
 
-# Запуск polling
-async def main():
+def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    await app.run_polling()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
