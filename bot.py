@@ -1,19 +1,19 @@
 import os
 import threading
 from flask import Flask
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters
-from openai import OpenAI
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ContextTypes, filters
+)
 
 # -------------------------
-# 🔑 Ключи из переменных окружения
+# 🔑 Ключи (OpenAI тут не нужен для курса-скрипта)
 # -------------------------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
-
 # -------------------------
-# ✅ Flask health-check (для Render)
+# ✅ Flask health-check
 # -------------------------
 app = Flask(__name__)
 
@@ -22,68 +22,97 @@ def home():
     return "AILVI bot is alive"
 
 def run_flask():
-    # Порт 10000 — как и раньше
     app.run(host="0.0.0.0", port=10000)
 
 # -------------------------
-# ✅ Telegram logic
+# 📘 Сценарий курса (пример — подставь свои реальные шаги)
 # -------------------------
+COURSE_QUESTIONS = [
+    "Начнём мягко. Как ты сейчас? В двух-трёх предложениях опиши своё внутреннее состояние.",
+    "Назови три вещи, за которые ты благодарен сегодня (кратко).",
+    "Что даёт тебе спокойствие в сложный день? Пример из жизни.",
+    "Какая одна привычка мешает двигаться к цели?",
+    "Какую сильную сторону ты в себе особенно ценишь?",
+]
 
-async def handle_message(update, context):
-    # Пропускаем не-текстовые апдейты
-    if not update.message or not update.message.text:
+INTRO_TEXT = (
+    "Ассаляму Алейкум. Я AILVI Guide. Я буду вести тебя шаг за шагом. "
+    "Отвечай коротко и честно — и мы сразу пойдём дальше."
+)
+
+FINISH_TEXT = (
+    "Спасибо, ты прошёл текущий блок вопросов. Если хочешь — напиши /start, "
+    "и мы начнём заново или продолжим с новыми вопросами."
+)
+
+# -------------------------
+# 🧠 Хранилище шага (в памяти на пользователя)
+# -------------------------
+def get_step(context: ContextTypes.DEFAULT_TYPE) -> int:
+    return context.user_data.get("step", 0)
+
+def set_step(context: ContextTypes.DEFAULT_TYPE, step: int):
+    context.user_data["step"] = step
+
+def current_question(step: int) -> str:
+    idx = min(step, len(COURSE_QUESTIONS) - 1)
+    return COURSE_QUESTIONS[idx]
+
+# -------------------------
+# 🤖 Handlers
+# -------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Сброс и старт курса
+    set_step(context, 0)
+    await update.message.reply_text(INTRO_TEXT)
+    await update.message.reply_text(current_question(0))
+
+async def repeat_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Повтор текущего вопроса (на случай «а что отвечать?»)
+    step = get_step(context)
+    if step >= len(COURSE_QUESTIONS):
+        await update.message.reply_text("Блок пройден. Напиши /start, чтобы начать заново.")
+        return
+    await update.message.reply_text(current_question(step))
+
+async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Получили ответ — двигаем шаг и задаём следующий вопрос
+    step = get_step(context)
+
+    # Если блок уже завершён — предлагаем перезапуск
+    if step >= len(COURSE_QUESTIONS):
+        await update.message.reply_text(FINISH_TEXT)
         return
 
-    user_text = update.message.text.strip()
+    # Мягкое подтверждение (без оценки)
+    # Текст ответа пользователя мы не сохраняем тут — можно подключить БД, если нужно.
+    await update.message.reply_text("Спасибо. Идём дальше.")
 
-    try:
-        # Диалог с GPT
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Ты — мягкий, спокойный и добрый проводник AILVI. "
-                        "Ты помогаешь человеку распаковывать личность шаг за шагом, "
-                        "задаёшь вопросы, мягко направляешь и не отвечаешь за него."
-                    ),
-                },
-                {"role": "user", "content": user_text},
-            ],
-        )
+    # Переходим на следующий вопрос
+    step += 1
+    set_step(context, step)
 
-        # ВАЖНО: в SDK v1 берём message.content, а не ["content"]
-        answer = resp.choices[0].message.content if resp.choices else "…"
+    if step >= len(COURSE_QUESTIONS):
+        await update.message.reply_text(FINISH_TEXT)
+    else:
+        await update.message.reply_text(current_question(step))
 
-        await update.message.reply_text(answer or "…")
-
-    except Exception as e:
-        # Неброский ответ, чтобы бот не падал из-за исключений
-        await update.message.reply_text("Извини, сейчас я чуть задумался. Попробуй ещё раз.")
-        # Можно залогировать в stdout, Render это покажет в логах
-        print(f"[ERROR] handle_message: {e}")
-
-async def start(update, context):
-    await update.message.reply_text("Ассаламу Алейкум. Я готов работать с тобой.")
-
+# -------------------------
+# 🚀 Telegram runner
+# -------------------------
 def run_telegram():
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CommandHandler("repeat", repeat_question))  # опционально
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_answer))
 
     print("✅ Telegram polling started")
     application.run_polling()
 
 # -------------------------
-# ✅ Main section
+# ✅ Main
 # -------------------------
 if __name__ == "__main__":
-    # Запускаем Flask в отдельном потоке
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-
-    # Запускаем Telegram бота
     run_telegram()
