@@ -1,439 +1,314 @@
+# bot.py
 import os
-import re
-import math
-import json
-import threading
-from datetime import datetime, timezone
-from typing import List, Dict
-from textwrap import shorten
+import html
+import logging
+from typing import List, Tuple
 
-from flask import Flask
+from flask import Flask, request
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+)
 from openai import OpenAI
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters
 
-import psycopg
-from psycopg.rows import dict_row
-from psycopg_pool import ConnectionPool
-
-# -------------------------
-# 🔑 Переменные окружения
-# -------------------------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# ==== Конфигурация ====
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
+OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY")
+WEBHOOK_BASE       = os.getenv("WEBHOOK_BASE")      # если используешь webhook
+WEBHOOK_SECRET     = os.getenv("WEBHOOK_SECRET")    # опционально, можно оставить пустым
 
+# Безопасный нейтральный стиль идентичности — не раскрываем платформы и провайдеров
+BOT_NAME = "AILVI_Guide"
+
+# ==== Логгер ====
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("ailvi-bot")
+
+# ==== OpenAI клиент ====
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# -------------------------
-# 🗄️ Postgres (пул + миграции)
-# -------------------------
-pool = ConnectionPool(conninfo=DATABASE_URL, kwargs={"autocommit": True})
-
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS users (
-  user_id BIGINT PRIMARY KEY,
-  first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS messages (
-  id BIGSERIAL PRIMARY KEY,
-  user_id BIGINT NOT NULL,
-  role TEXT NOT NULL CHECK (role IN ('user','assistant','system')),
-  content TEXT NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_messages_user_id_created_at ON messages(user_id, created_at);
-
-CREATE TABLE IF NOT EXISTS progress (
-  user_id BIGINT PRIMARY KEY,
-  intention BOOLEAN DEFAULT FALSE,
-  episodes BOOLEAN DEFAULT FALSE,
-  values BOOLEAN DEFAULT FALSE,
-  energy BOOLEAN DEFAULT FALSE,
-  flow BOOLEAN DEFAULT FALSE,
-  rbs BOOLEAN DEFAULT FALSE,
-  traits BOOLEAN DEFAULT FALSE,
-  strengths BOOLEAN DEFAULT FALSE,
-  interests BOOLEAN DEFAULT FALSE,
-  skills BOOLEAN DEFAULT FALSE,
-  environment BOOLEAN DEFAULT FALSE,
-  roles BOOLEAN DEFAULT FALSE,
-  hypotheses BOOLEAN DEFAULT FALSE,
-  experiments BOOLEAN DEFAULT FALSE,
-  strategy BOOLEAN DEFAULT FALSE,
-  offered_summary_at TIMESTAMPTZ,
-  summary_sent_at TIMESTAMPTZ
-);
-
-CREATE TABLE IF NOT EXISTS summaries (
-  id BIGSERIAL PRIMARY KEY,
-  user_id BIGINT NOT NULL,
-  summary_text TEXT NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-"""
-
-# -------------------------
-# 🌿 Тексты и капсулы
-# -------------------------
-WELCOME_TEXT = (
-    "Ассаляму Алейкум уа РахматуЛлахи уа Баракятух! 👋🏻\n\n"
-    "Добро пожаловать в пространство, где Сердце узнаёт себя заново.\n\n"
-    "Давай вместе, спокойно, шаг за шагом откроем дары, которые Аллах уже вложил в твою Душу — силы, таланты, намерения. 💎\n\n"
-    "Пусть Аллах сделает этот путь лёгким, благословенным и наполненным пониманием!\n\n"
-    "Чтобы начать глубокую распаковку — напиши: «Начинаем»"
-)
-
-SYSTEM_CAPSULE = (
-    "Ты — мягкий, спокойный, внимательный проводник AILVI. "
-    "Говоришь нейтрально (без указания пола), тепло и бережно. "
-    "Ведёшь живую распаковку личности: каждый следующий шаг рождается из ответа собеседника. "
-    "Без давления и мотивационных клише. Атмосфера Ислама достойная и мягкая; цитаты Корана/хадисов — только по запросу. "
-    "Пиши простым русским, допускай уместные эмодзи. "
-    "Цель: помочь увидеть ценности, сильные стороны, естественные роли и среду. "
-    "Если человека тянет сразу к деньгам — мягко возвращай к глубине, затем связывай с профессиональными гипотезами. "
-    "Слово «ризк» писать именно так: ризк."
-)
-
-# Модули пути (сверим чек-лист прогресса; когда все True — предложим итог)
-MODULE_KEYS = [
-    "intention", "episodes", "values", "energy", "flow", "rbs",
-    "traits", "strengths", "interests", "skills", "environment",
-    "roles", "hypotheses", "experiments", "strategy"
-]
-
-# -------------------------
-# ✅ Flask health-check
-# -------------------------
+# ==== Flask (если нужно держать вебхук на Render) ====
 app = Flask(__name__)
 
-@app.route("/")
-def home():
-    return "AILVI bot is alive"
+# -----------------------------------------------------------------------------
+# УТИЛИТЫ ФОРМАТИРОВАНИЯ (HTML)
+# -----------------------------------------------------------------------------
 
-def run_flask():
-    app.run(host="0.0.0.0", port=10000)
+def esc(t: str) -> str:
+    """Экранируем пользовательский текст, чтобы HTML Telegram не сломался."""
+    return html.escape(t or "")
 
-# -------------------------
-# 🧠 DB helpers
-# -------------------------
-def init_db():
-    with pool.connection() as conn, conn.cursor() as cur:
-        cur.execute(SCHEMA_SQL)
+def b(t: str) -> str:
+    return f"<b>{t}</b>"
 
-def ensure_user(user_id: int):
-    with pool.connection() as conn, conn.cursor() as cur:
-        cur.execute("INSERT INTO users(user_id) VALUES (%s) ON CONFLICT DO NOTHING;", (user_id,))
-        cur.execute("INSERT INTO progress(user_id) VALUES (%s) ON CONFLICT DO NOTHING;", (user_id,))
+def i(t: str) -> str:
+    return f"<i>{t}</i>"
 
-def save_message(user_id: int, role: str, content: str):
-    with pool.connection() as conn, conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO messages(user_id, role, content) VALUES (%s, %s, %s);",
-            (user_id, role, content),
-        )
+def u(t: str) -> str:
+    return f"<u>{t}</u>"
 
-def fetch_context(user_id: int, limit: int = 20):
-    """Окно контекста для модели (экономим токены). Хранилище — полное, тут только подача в модель."""
-    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(
-            """
-            SELECT role, content
-            FROM messages
-            WHERE user_id = %s AND role IN ('user','assistant')
-            ORDER BY created_at DESC
-            LIMIT %s;
-            """,
-            (user_id, limit),
-        )
-        rows = cur.fetchall()
-    rows.reverse()
-    return [{"role": r["role"], "content": r["content"]} for r in rows]
+def p(*lines: str) -> str:
+    """
+    Формирует абзац: объединяет строки, после абзаца ставит пустую строку.
+    Пример: p(b('Заголовок'), 'Текст абзаца.')
+    """
+    body = "".join(lines)
+    return body + "\n\n"
 
-def fetch_all_messages(user_id: int):
-    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(
-            "SELECT role, content, created_at FROM messages WHERE user_id = %s ORDER BY created_at ASC;",
-            (user_id,),
-        )
-        return cur.fetchall()
+def bullet(items: List[str]) -> str:
+    """Нумерация/маркировка со спокойными эмодзи."""
+    return "".join(f"• {item}\n" for item in items) + "\n"
 
-def get_progress(user_id: int) -> Dict[str, bool]:
-    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-        cur.execute("SELECT * FROM progress WHERE user_id = %s;", (user_id,))
-        row = cur.fetchone()
-    if not row:
-        return {k: False for k in MODULE_KEYS}
-    return {k: bool(row[k]) for k in MODULE_KEYS}
+def chunk_telegram(text: str, limit: int = 4096) -> List[str]:
+    """Нарезаем длинный HTML-текст на куски до лимита Telegram."""
+    parts: List[str] = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut == -1:
+            cut = limit
+        parts.append(text[:cut])
+        text = text[cut:]
+    parts.append(text)
+    return parts
 
-def set_progress_flags(user_id: int, updates: Dict[str, bool]):
-    if not updates:
-        return
-    sets = []
-    vals = []
-    for k, v in updates.items():
-        if k in MODULE_KEYS:
-            sets.append(f"{k} = %s")
-            vals.append(bool(v))
-    if not sets:
-        return
-    vals.append(user_id)
-    with pool.connection() as conn, conn.cursor() as cur:
-        cur.execute(f"UPDATE progress SET {', '.join(sets)} WHERE user_id = %s;", vals)
+async def send_html(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str):
+    """Отправка HTML-сообщения с автоматической нарезкой по лимиту."""
+    for part in chunk_telegram(text):
+        await ctx.bot.send_message(chat_id=chat_id, text=part, parse_mode="HTML")
 
-def mark_offered(user_id: int):
-    with pool.connection() as conn, conn.cursor() as cur:
-        cur.execute("UPDATE progress SET offered_summary_at = NOW() WHERE user_id = %s;", (user_id,))
+# -----------------------------------------------------------------------------
+# ТЕКСТЫ
+# -----------------------------------------------------------------------------
 
-def mark_summary_sent(user_id: int):
-    with pool.connection() as conn, conn.cursor() as cur:
-        cur.execute("UPDATE progress SET summary_sent_at = NOW() WHERE user_id = %s;", (user_id,))
-
-def get_offer_status(user_id: int):
-    with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-        cur.execute("SELECT offered_summary_at, summary_sent_at FROM progress WHERE user_id = %s;", (user_id,))
-        row = cur.fetchone()
-    return row["offered_summary_at"], row["summary_sent_at"]
-
-def save_summary(user_id: int, text: str):
-    with pool.connection() as conn, conn.cursor() as cur:
-        cur.execute("INSERT INTO summaries(user_id, summary_text) VALUES (%s, %s);", (user_id, text))
-
-# -------------------------
-# 🧭 Классификация шага (без показа пользователю)
-# -------------------------
-CLASSIFIER_SYSTEM = (
-    "Ты — ассистент-классификатор AILVI. Получишь кусочек диалога (несколько последних реплик). "
-    "Определи, какие из модулей пути были покрыты содержательно. Верни JSON с булевыми полями:\n"
-    "{intention, episodes, values, energy, flow, rbs, traits, strengths, interests, "
-    "skills, environment, roles, hypotheses, experiments, strategy}\n"
-    "Ставь true только если по этому модулю пользователь дал осмысленные данные или обсуждение явно состоялось. "
-    "Без текста, только JSON."
+WELCOME_TEXT = (
+    p(b("Ассаляму алейкум! ") + "👋🏻")
+    + p("Добро пожаловать в пространство, где Сердце узнаёт себя заново.")
+    + p("Пойдём спокойно, мягко, шаг за шагом. Я помогу увидеть твои природные дары, ценности и направление служения — без спешки и без давления. 💫")
+    + p(i("Чтобы начать глубокую распаковку — напиши: ") + b("Начинаем"))
 )
 
-def classify_progress_from_context(context_messages: List[Dict[str, str]]) -> Dict[str, bool]:
-    snippet = "\n".join(f"{m['role']}: {m['content']}" for m in context_messages[-8:])  # последние 8 реплик
+def first_turn_text() -> str:
+    return (
+        p(b("С радостью начинаю распаковку. ✨"))
+        + p(
+            i("Расскажи мне…")
+            + " Что сейчас самое важное для тебя? "
+            + "Это может быть поиск смысла, усталость, желание ясности в работе, тяга к переменам или мечта, которая не отпускает."
+        )
+        + bullet([
+            "«Не понимаю, где моя сила»",
+            "«Хочу ясности в работе»",
+            "«Чувствую усталость и хочу перемен»",
+        ])
+        + p("Можно коротко. 🌿")
+    )
+
+def gentle_followup(user_msg: str) -> str:
+    return (
+        p(b("Я рядом.") + " Спасибо за искренность. 🤝")
+        + p(
+            "Чтобы двигаться глубже, давай нащупаем опорные точки. "
+            + "Отвечай так, как чувствуешь — коротко, без идеальности."
+        )
+        + bullet([
+            b("Что приносит радость?") + " Вспомни моменты, когда жизнь наполнялась теплом. Какие дела или роли давали живую энергию?",
+            b("Что интересует?") + " Темы, к которым тянет. То, что давно хотелось попробовать.",
+            b("Как хочешь помогать?") + " Кому и в чём тебе естественно быть полез(н)ым?",
+        ])
+        + p(i("Пиши в свободной форме — я соберу нить и поведу дальше."))
+    )
+
+def format_summary_ready() -> str:
+    return (
+        p(b("Мы собрали основу твоего пути. 🌱"))
+        + p("Хочешь получить сжатую карту того, что мы выяснили: ценности, сильные стороны, природные роли, условия среды и ближайшие эксперименты?")
+        + p(i("Если да, напиши: ") + b("Дай итог"))
+    )
+
+def summary_text(summary: str) -> str:
+    return (
+        p(b("Карта твоего пути — кратко и по делу. 🗺"))
+        + p(summary)
+        + p(i("Готов двигаться к малым экспериментам? Напиши: ") + b("Эксперименты"))
+    )
+
+# -----------------------------------------------------------------------------
+# ПРОСТЕЙШЕЕ «СОСТОЯНИЕ» В ПАМЯТИ ПРОЦЕССА (для Render Free перезапустится)
+# Для железобетона у тебя уже поднят PostgreSQL — интеграцию можно включить.
+# Здесь оставляю легковесную карту последних шагов.
+# -----------------------------------------------------------------------------
+
+# chat_id -> simple state
+STATE: dict[int, str] = {}
+
+# -----------------------------------------------------------------------------
+# ЛОГИКА ДИАЛОГА
+# -----------------------------------------------------------------------------
+
+def is_start(msg: str) -> bool:
+    m = (msg or "").strip().lower()
+    return m in ("/start", "start", "старт")
+
+def is_begin(msg: str) -> bool:
+    return (msg or "").strip().lower() == "начинаем"
+
+def is_summary_request(msg: str) -> bool:
+    m = (msg or "").strip().lower()
+    return m in ("дай итог", "итог", "выдай итог", "покажи итог")
+
+async def handle_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    STATE[chat_id] = "welcome"
+    await send_html(ctx, chat_id, WELCOME_TEXT)
+
+async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+    chat_id = update.effective_chat.id
+    user_text = update.message.text
+
+    # Фильтр на попытки «кто ты? ты chatgpt?» — мягкий отказ
+    lowered = user_text.lower()
+    if any(k in lowered for k in ["chatgpt", "openai", "gpt", "кто ты", "ты бот", "ты чатжпт"]):
+        reply = (
+            p(b("Я — AILVI_Guide.") + " Я рядом, чтобы мягко и бережно вести разговор о твоём пути. 🤝")
+            + p("Сфокусируемся на тебе и твоих шагах — так будет полезнее.")
+        )
+        await send_html(ctx, chat_id, reply)
+        return
+
+    # Ветвление по состоянию / фразам:
+    if is_start(user_text):
+        return await handle_start(update, ctx)
+
+    if is_begin(user_text):
+        STATE[chat_id] = "first_turn"
+        return await send_html(ctx, chat_id, first_turn_text())
+
+    if is_summary_request(user_text):
+        # Здесь ты можешь подставить реальную сборку из БД.
+        # Пока соберём из краткой LM-выжимки по истории (демо).
+        synthesis = build_llm_synthesis(chat_id)
+        return await send_html(ctx, chat_id, summary_text(esc(synthesis)))
+
+    # Основной диалог — сначала отвечаем тёплым структурирующим блоком,
+    # затем — берём смысл из модели и подаём мягкую следующую «ступеньку».
+    state = STATE.get(chat_id, "")
+    if state in ("first_turn", "deepening"):
+        # 1) Тёплый «ведущий» блок (фиксированный)
+        if state == "first_turn":
+            await send_html(ctx, chat_id, gentle_followup(user_text))
+            STATE[chat_id] = "deepening"
+            return
+
+        # 2) Далее — микро-петля: анализ ответа + шаг-вопрос вперёд
+        coach_answer = build_llm_step(chat_id, user_text)
+        await send_html(ctx, chat_id, coach_answer)
+
+        # Периодически предлагай итог, чтобы человек знал о возможности
+        await send_html(ctx, chat_id, format_summary_ready())
+        return
+
+    # Если пользователь написал что-то «с пустого места» — мягко запускаем поток
+    await send_html(ctx, chat_id, WELCOME_TEXT)
+
+# -----------------------------------------------------------------------------
+# ВСПОМОГАТЕЛЬНЫЕ ВЫЗОВЫ МОДЕЛИ
+# -----------------------------------------------------------------------------
+
+def build_llm_synthesis(chat_id: int) -> str:
+    """
+    Делаем компактную выжимку. Здесь можно прокинуть историю из БД.
+    Сейчас — минимальный пример: одна подсказка, без раскрытия провайдера.
+    """
+    prompt = (
+        "Собери краткую карту личности человека на основе наших недавних сообщений. "
+        "Структура: 1) Ценности; 2) Сильные стороны; 3) Интересы/среда; "
+        "4) Естественные роли; 5) Риски/дренажи; 6) Микро-эксперименты на 7–10 дней. "
+        "Пиши по-русски, спокойно, без коуч-клише. Формат — короткие пункты."
+    )
+    msg = [{"role": "user", "content": prompt}]
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",  # лёгкая и быстрая модель
+        messages=msg,
+        temperature=0.4,
+    )
+    text = resp.choices[0].message.content.strip()
+    return text
+
+def build_llm_step(chat_id: int, user_text: str) -> str:
+    """
+    Генерирует мягкий следующий шаг. Возвращаем уже HTML-отформатированный текст.
+    """
+    system = (
+        "Ты — бережный духовно-созерцательный наставник. Никаких упоминаний о платформах. "
+        "Говори по-русски. Тон: тёплый, спокойный, с дыханием, без давления. "
+        "Структура ответа: 1) короткое признание смысла сказанного; "
+        "2) 1–2 ясных уточняющих вопроса; 3) одна маленькая практика/наблюдение. "
+        "Не используй звёздочки для форматирования — верни разметку как HTML (<b>, <i>, абзацы)."
+    )
+    user = (
+        f"Ответ человека: «{user_text}».\n"
+        "Сделай следующий мягкий шаг, чтобы вести к распаковке ценностей/ролей/среды, "
+        "избегай разговоров про деньги до финального синтеза."
+    )
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": CLASSIFIER_SYSTEM},
-            {"role": "user", "content": snippet}
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
         ],
-        temperature=0
+        temperature=0.5,
     )
-    txt = resp.choices[0].message.content or "{}"
-    try:
-        data = json.loads(txt)
-        return {k: bool(data.get(k, False)) for k in MODULE_KEYS}
-    except Exception:
-        return {}
+    raw = resp.choices[0].message.content.strip()
 
-def all_modules_done(progress: Dict[str, bool]) -> bool:
-    return all(progress.get(k, False) for k in MODULE_KEYS)
+    # На случай, если модель вернула обычный текст — обернём абзацами.
+    # (В идеале она уже вернёт HTML. Но подстрахуемся.)
+    if "<b>" not in raw and "<i>" not in raw and "<u>" not in raw:
+        raw = p(b("Слышу тебя.")) + p(esc(raw))
 
-# -------------------------
-# 📜 Итоговая сборка (из всей истории)
-# -------------------------
-CHUNK_SIZE = 80
+    return raw
 
-SUMMARY_SYSTEM = (
-    "Ты — аналитик AILVI. Получишь историю диалога (user/assistant). "
-    "Сначала извлеки факты и маркеры из этих сообщений без домыслов, списком."
-)
+# -----------------------------------------------------------------------------
+# TELEGRAM HANDLERS
+# -----------------------------------------------------------------------------
 
-SUMMARY_USER_INSTR = (
-    "Извлеки из блока диалога только то, что относится к личности пользователя. "
-    "Верни JSON со структурами: {"
-    "\"values\": [строки], "
-    "\"strengths\": [строки], "
-    "\"interests\": [строки], "
-    "\"environments\": [строки], "
-    "\"roles\": [строки], "
-    "\"motivators\": [строки], "
-    "\"drainers\": [строки], "
-    "\"blockers\": [строки], "
-    "\"examples\": [краткие цитаты пользователя]"
-    "}. Без пояснений, только JSON."
-)
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await handle_start(update, ctx)
 
-MERGE_SYSTEM = (
-    "Ты — аналитик AILVI. Объедини несколько JSON-выжимок в единую, устранив повторы и противоречия."
-)
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await handle_message(update, ctx)
 
-FINAL_SYSTEM = (
-    "Ты — проводник AILVI. На основе объединённого JSON создай ясный итог для человека: "
-    "1) Ценности (5–9)  2) Сильные стороны (5–9)  3) Естественная среда  "
-    "4) Возможные роли (2–4)  5) Мотиваторы и дренаж  6) Три гипотезы призвания (формула «Я силён в…, люблю…, миру нужно…»)  "
-    "7) Идеи 2–3 микро-экспериментов на 7–10 дней  8) Тихая рекомендация по режиму/среде. "
-    "Тон мягкий, без пола, с уместными эмодзи. Короткие абзацы и списки."
-)
-
-def _ask_openai(messages, temperature=0.2):
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages,
-        temperature=temperature,
-    )
-    return resp.choices[0].message.content
-
-def build_final_summary_for_user(user_id: int) -> str:
-    data = fetch_all_messages(user_id)
-    if not data:
-        return "История пока пуста. Давай начнём с «Начинаем». 🌿"
-
-    chunks = [data[i:i+CHUNK_SIZE] for i in range(0, len(data), CHUNK_SIZE)]
-    json_summaries = []
-    for chunk in chunks:
-        text_block = "\n".join(
-            f"[{row['created_at'].isoformat()}] {row['role']}: {row['content']}"
-            for row in chunk
-        )
-        j = _ask_openai([
-            {"role": "system", "content": SUMMARY_SYSTEM},
-            {"role": "user", "content": SUMMARY_USER_INSTR + "\n\n---\n" + text_block}
-        ])
-        json_summaries.append(j)
-
-    merged = _ask_openai([
-        {"role": "system", "content": MERGE_SYSTEM},
-        {"role": "user", "content": "Объедини эти JSON-выжимки:\n" + "\n\n".join(json_summaries)}
-    ])
-
-    final_text = _ask_openai([
-        {"role": "system", "content": FINAL_SYSTEM},
-        {"role": "user", "content": merged}
-    ], temperature=0.4)
-
-    return final_text
-
-# -------------------------
-# 📨 НЛУ: согласие/отказ на показ итога
-# -------------------------
-YES_PAT = re.compile(r"\b(да|давай|покажи|хочу|готов|итог|резюме|давай\s*итог|давай\s*резюме)\b", re.I)
-NO_PAT  = re.compile(r"\b(пока\s*нет|не\s*сейчас|потом|не нужно|не надо)\b", re.I)
-
-def is_yes(text: str) -> bool:
-    return bool(YES_PAT.search(text or ""))
-
-def is_no(text: str) -> bool:
-    return bool(NO_PAT.search(text or ""))
-
-# -------------------------
-# 🤖 Телеграм-логика
-# -------------------------
-def first_prompt_after_begin():
-    return (
-        "С радостью начинаю распаковку. ✨\n"
-        "Расскажи, какой большой вопрос у тебя сейчас на сердце — "
-        "про смысл, призвание, отношения с работой или ощущение себя? "
-        "Примеры: «не понимаю, где моя сила», «хочу ясности в работе», "
-        "«чувствую усталость и хочу перемен». Можешь коротко. 🌿"
-    )
-
-async def start(update, context):
-    user = update.effective_user
-    ensure_user(user.id)
-    save_message(user.id, "assistant", WELCOME_TEXT)
-    await update.message.reply_text(WELCOME_TEXT)
-
-async def handle_message(update, context):
-    user = update.effective_user
-    text = (update.message.text or "").strip()
-    ensure_user(user.id)
-
-    # Стартовая реплика
-    if text.lower() in ("начинаем", "начать", "start"):
-        prompt = first_prompt_after_begin()
-        save_message(user.id, "assistant", prompt)
-        await update.message.reply_text(prompt)
-        return
-
-    # Сохраняем пользовательскую реплику
-    save_message(user.id, "user", text)
-
-    # Проверяем: если ранее мы предложили итог и человек согласен — показываем
-    offered_at, summary_sent_at = get_offer_status(user.id)
-    if offered_at and not summary_sent_at and is_yes(text):
-        await send_summary_messages(user.id, update)
-        return
-    if offered_at and not summary_sent_at and is_no(text):
-        # Мягко продолжаем без итога
-        reply = "Хорошо, оставим итог на потом. Продолжим движение мягко и без спешки. 🌿"
-        save_message(user.id, "assistant", reply)
-        await update.message.reply_text(reply)
-        return
-
-    # Генерируем ответ по «окну» + системной капсуле
-    history = [{"role": "system", "content": SYSTEM_CAPSULE}]
-    history += fetch_context(user.id, limit=20)
-
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=history,
-            temperature=0.6,
-        )
-        answer = resp.choices[0].message.content
-    except Exception:
-        answer = "Кажется, возникла техническая пауза. Попробуем ещё раз через мгновение. 🌿"
-
-    save_message(user.id, "assistant", answer)
-    await update.message.reply_text(answer)
-
-    # После ответа обновим прогресс по классификатору и при необходимости предложим итог
-    try:
-        ctx_for_cls = fetch_context(user.id, limit=20)
-        flags = classify_progress_from_context(ctx_for_cls)
-        set_progress_flags(user.id, flags)
-
-        progress = get_progress(user.id)
-        offered_at, summary_sent_at = get_offer_status(user.id)
-
-        if all_modules_done(progress) and not offered_at and not summary_sent_at:
-            offer = (
-                "Похоже, мы собрали все важные кусочки твоей картины. ✨ "
-                "Хочешь, соберу и покажу аккуратный итог: ценности, сильные стороны, естественную среду, роли, "
-                "три гипотезы призвания и идеи микро-экспериментов? Ответь просто «да» — и я пришлю."
-            )
-            mark_offered(user.id)
-            save_message(user.id, "assistant", offer)
-            await update.message.reply_text(offer)
-    except Exception:
-        # Тихо игнорируем сбой классификатора — диалог не должен ломаться
-        pass
-
-async def send_summary_messages(user_id: int, update):
-    await update.message.reply_text("Формирую твой аккуратный итог… это займёт минутку. 📜")
-    try:
-        final_text = build_final_summary_for_user(user_id)
-        save_summary(user_id, final_text)
-        mark_summary_sent(user_id)
-
-        MAX_LEN = 3500
-        parts = [final_text[i:i+MAX_LEN] for i in range(0, len(final_text), MAX_LEN)]
-        for idx, p in enumerate(parts, 1):
-            header = f"Итог (часть {idx}/{len(parts)}):\n\n" if len(parts) > 1 else ""
-            await update.message.reply_text(header + p)
-    except Exception:
-        await update.message.reply_text("Не вышло собрать итог прямо сейчас. Попробуем чуть позже. 🌿")
-
-def run_telegram():
+def build_app():
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    # /start нужен только для первого приветствия — кнопок и команд для пользователя больше нет
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    return application
 
-    print("✅ Telegram polling started")
-    application.run_polling()
+# -----------------------------------------------------------------------------
+# POINTS OF ENTRY
+# -----------------------------------------------------------------------------
 
-# -------------------------
-# 🚀 Main
-# -------------------------
+telegram_app = build_app()
+
+@app.route("/", methods=["GET"])
+def health():
+    return "ok", 200
+
+@app.route("/hook", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+    telegram_app.update_queue.put_nowait(update)
+    return "ok", 200
+
+def run_polling():
+    telegram_app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 if __name__ == "__main__":
-    init_db()
-
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-
-    run_telegram()
+    # По умолчанию — polling (для фри-плана Render удобно).
+    # Если используешь вебхук, просто настрой маршрут /hook и включи в Render.
+    log.info("Starting bot in polling mode…")
+    run_polling()
