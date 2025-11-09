@@ -5,17 +5,16 @@ import logging
 from typing import List, Tuple
 
 from openai import OpenAI
-
 from psycopg_pool import AsyncConnectionPool
 
 from telegram import Update
-from telegram.constants import ParseMode, ALL_UPDATE_TYPES
+from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
     MessageHandler,
     CommandHandler,
-    Defaults,        # ВАЖНО: Defaults теперь здесь
+    Defaults,
     filters,
 )
 
@@ -35,7 +34,6 @@ DB_SSLMODE = os.environ.get("DB_SSLMODE", "require")
 MODE = os.environ.get("MODE", "polling").lower()     # "polling" | "webhook"
 WEBHOOK_BASE = os.environ.get("WEBHOOK_BASE", "").rstrip("/")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "ailvi-secret")
-
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")      # опционально
 
 # -------------------- OPENAI --------------------
@@ -245,7 +243,6 @@ async def on_start(app):
 
 
 def build_app():
-    # ВАЖНО: Defaults берём из telegram.ext.Defaults
     defaults = Defaults(parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
     app = (
@@ -276,7 +273,7 @@ if __name__ == "__main__":
         )
     else:
         application.run_polling(
-            allowed_updates=ALL_UPDATE_TYPES,
+            allowed_updates=Update.ALL_TYPES,  # <-- фикс
             drop_pending_updates=True,
             close_loop=False,
             stop_signals=None,
