@@ -1,318 +1,283 @@
 # bot.py
+import os
 import asyncio
 import logging
-import os
-from datetime import datetime, timezone
 from typing import List, Tuple
 
-import httpx
 from openai import OpenAI
-from telegram import Update, constants
+
+from psycopg_pool import AsyncConnectionPool
+
+from telegram import Update
+from telegram.constants import ParseMode, ALL_UPDATE_TYPES
 from telegram.ext import (
     ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
     ContextTypes,
+    MessageHandler,
+    CommandHandler,
+    Defaults,        # ВАЖНО: Defaults теперь здесь
     filters,
 )
 
-import psycopg
-from psycopg.rows import tuple_row
-from psycopg_pool import AsyncConnectionPool
-
-# ---------- Конфиг ----------
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-DATABASE_URL = os.environ["DATABASE_URL"]  # полный URL из Render
-DB_SSLMODE = os.getenv("DB_SSLMODE", "require")  # обычно 'require'
-
-# режим работы чата
-WELCOME_TEXT = (
-    "Ассаляму Алейкум уа РахматуЛлахи уа Баракятух! 👋🏻<br><br>"
-    "Добро пожаловать в пространство, где Сердце узнаёт себя заново.<br><br>"
-    "Давай вместе, спокойно, шаг за шагом, откроем дары, которые Аллах уже вложил в твою душу — "
-    "силы, таланты, намерения. 💎<br><br>"
-    "Пусть Аллах сделает этот путь лёгким и наполненным пониманием!<br><br>"
-    "Чтобы начать глубокую распаковку — напиши: <b>Начинаем</b>."
-)
-
-SYSTEM_PROMPT = (
-    "Ты — мягкий духовный наставник AILVI. Отвечай по-человечески: тепло, кратко, по делу, "
-    "без канцелярита. Вежливо избегай любых упоминаний моделей, компаний и технологий. "
-    "Никогда не признавайся, что ты ИИ, модель или как-то связан с OpenAI/ChatGPT.\n\n"
-    "Контекст: стиль Ислама, мягкость, без осуждения; ты задаёшь наводящие вопросы и ведёшь человека "
-    "к ясности: ценности, сильные стороны, где энергия, какие шаги малыми итерациями.\n\n"
-    "Форматируй ответ HTML-тегами: <b>жирный</b>, <i>курсив</i>, абзацы через <br><br>. "
-    "Эмодзи допустимы умеренно. Не используй Markdown-звёздочки.\n\n"
-    "Если человек начинает про работу/деньги раньше времени, мягко возвращай к внутренней ясности "
-    "и наблюдениям, обещая вернуться к заработку позже. Не давай списков профессий раньше времени."
-)
-
-FIRST_QUESTION = (
-    "<b>С радостью начинаю распаковку.</b> ✨<br><br>"
-    "Расскажи, какой большой вопрос у тебя сейчас на сердце: про смысл, призвание, отношения с работой "
-    "или ощущение себя? Можно коротко: «не понимаю, где моя сила», «хочу ясности в работе», "
-    "«чувствую усталость и хочу перемен». 🌿"
-)
-
-# ---------- Логирование ----------
+# -------------------- ЛОГИ --------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("ailvi-bot")
 
-# ---------- OpenAI ----------
-client = OpenAI(api_key=OPENAI_API_KEY)
-httpx_client = httpx.AsyncClient(timeout=60)
+# -------------------- ENV --------------------
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+DATABASE_URL = os.environ["DATABASE_URL"]
+DB_SSLMODE = os.environ.get("DB_SSLMODE", "require")
 
-# ---------- БД (PostgreSQL, async pool) ----------
+MODE = os.environ.get("MODE", "polling").lower()     # "polling" | "webhook"
+WEBHOOK_BASE = os.environ.get("WEBHOOK_BASE", "").rstrip("/")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "ailvi-secret")
+
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")      # опционально
+
+# -------------------- OPENAI --------------------
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# -------------------- БД --------------------
 POOL: AsyncConnectionPool | None = None
 
 
-async def db_init() -> None:
-    """Создаём соединения и таблицы, если их нет."""
+def _pg_dsn() -> str:
+    if "sslmode=" in DATABASE_URL:
+        return DATABASE_URL
+    sep = "&" if "?" in DATABASE_URL else "?"
+    return f"{DATABASE_URL}{sep}sslmode={DB_SSLMODE}"
+
+
+async def db_init():
     global POOL
-    # добавляем sslmode в DSN, если его нет
-    dsn = DATABASE_URL
-    if "sslmode=" not in dsn:
-        dsn += f"?sslmode={DB_SSLMODE}"
+    if POOL is None:
+        POOL = AsyncConnectionPool(_pg_dsn(), min_size=1, max_size=5, kwargs={"prepare_threshold": 0})
+        log.info("Postgres pool created")
 
-    POOL = AsyncConnectionPool(
-        conninfo=dsn,
-        max_size=8,
-        kwargs={"row_factory": tuple_row},
-    )
-
-    async with POOL.connection() as aconn:
-        async with aconn.cursor() as cur:
+    async with POOL.connection() as con:
+        async with con.cursor() as cur:
             await cur.execute(
                 """
                 create table if not exists users (
-                    user_id      bigint primary key,
-                    created_at   timestamptz not null default now(),
-                    state        jsonb not null default '{}'::jsonb
+                  user_id bigint primary key,
+                  created_at timestamptz default now()
                 );
                 """
             )
             await cur.execute(
                 """
-                create table if not exists dialog (
-                    id           bigserial primary key,
-                    user_id      bigint not null,
-                    ts           timestamptz not null default now(),
-                    role         text not null,          -- 'user' | 'assistant' | 'system'
-                    content      text not null
+                create table if not exists messages (
+                  id bigserial primary key,
+                  user_id bigint not null,
+                  role text not null check (role in ('user','assistant','system')),
+                  content text not null,
+                  created_at timestamptz default now()
                 );
                 """
             )
-        await aconn.commit()
+        await con.commit()
+    log.info("DB schema ensured")
 
 
-async def db_upsert_user(user_id: int) -> None:
-    async with POOL.connection() as aconn:
-        async with aconn.cursor() as cur:
+async def db_add_user(user_id: int):
+    async with POOL.connection() as con:
+        async with con.cursor() as cur:
             await cur.execute(
-                """
-                insert into users (user_id) values (%s)
-                on conflict (user_id) do nothing;
-                """,
+                "insert into users(user_id) values (%s) on conflict (user_id) do nothing;",
                 (user_id,),
             )
-        await aconn.commit()
+        await con.commit()
 
 
-async def db_add_message(user_id: int, role: str, content: str) -> None:
-    async with POOL.connection() as aconn:
-        async with aconn.cursor() as cur:
+async def db_add_message(user_id: int, role: str, content: str):
+    async with POOL.connection() as con:
+        async with con.cursor() as cur:
             await cur.execute(
-                "insert into dialog (user_id, role, content) values (%s, %s, %s);",
+                "insert into messages(user_id, role, content) values (%s,%s,%s);",
                 (user_id, role, content),
             )
-        await aconn.commit()
+        await con.commit()
 
 
-async def db_last_messages(user_id: int, limit: int = 40) -> List[Tuple[str, str]]:
-    """Возвращает последние сообщения (role, content)."""
-    async with POOL.connection() as aconn:
-        async with aconn.cursor() as cur:
+async def db_recent_dialogue(user_id: int, limit_pairs: int = 10) -> List[Tuple[str, str]]:
+    async with POOL.connection() as con:
+        async with con.cursor() as cur:
             await cur.execute(
                 """
                 select role, content
-                from dialog
-                where user_id = %s
-                order by id desc
+                from messages
+                where user_id=%s and role in ('user','assistant')
+                order by created_at desc
                 limit %s;
                 """,
-                (user_id, limit),
+                (user_id, limit_pairs * 2),
             )
             rows = await cur.fetchall()
     rows.reverse()
-    return rows
+    return rows  # [(role, content), ...]
 
 
-# ---------- Утилиты ----------
-async def send_html(update: Update, text: str) -> None:
-    await update.effective_chat.send_message(
-        text,
-        parse_mode=constants.ParseMode.HTML,
-        disable_web_page_preview=True,
+# -------------------- СТИЛЬ --------------------
+SYSTEM_PROMPT = (
+    "Ты — AILVI, мягкий наставник. Говоришь по-русски тепло и глубоко, без давления, "
+    "уважая нормы Ислама. Никогда не упоминай OpenAI/ChatGPT/модель. "
+    "Ответы форматируй в HTML (<b>, <i>, <u>, <br>), делай абзацы через пустую строку. "
+    "Веди человека маленькими шагами к ясности: сильные стороны, ценности, роли, спокойные действия."
+)
+
+WELCOME_TEXT = (
+    "<b>Ассаляму Алейкум уа РахматуЛлахи уа Баракятух! 👋🏻</b>\n\n"
+    "Добро пожаловать в пространство, где Сердце узнаёт себя заново.\n\n"
+    "Давай вместе, спокойно, шаг за шагом, откроем дары, которые Аллах уже вложил "
+    "в твою Душу — силы, таланты и намерения. 💎\n\n"
+    "Пусть Аллах сделает этот путь лёгким, благословенным и наполненным пониманием!\n\n"
+    "Чтобы начать глубокую распаковку — напиши: <b>Начинаем</b>"
+)
+
+FIRST_QUESTION = (
+    "<b>С радостью начинаю распаковку. ✨</b>\n\n"
+    "Начнём с самого важного для тебя сейчас.\n\n"
+    "<i>Расскажи кратко:</i> какой большой вопрос у тебя на сердце — про смысл, призвание, "
+    "отношения с работой или ощущение себя? Например: «не понимаю, где моя сила», "
+    "«хочу ясности в работе», «чувствую усталость и хочу перемен»."
+)
+
+# -------------------- АНТИ-РАСКРЫТИЕ --------------------
+DENY_PATTERNS = [
+    "openai", "chatgpt", "as an ai", "i am an ai", "i'm an ai",
+    "as a model", "language model", "gpt", "gpt-4", "gpt-4o",
+    "powered by openai", "модель искусственного интеллекта", "как модель", "как чатгпт",
+]
+
+
+def contains_forbidden(text: str) -> bool:
+    low = (text or "").lower()
+    return any(p in low for p in DENY_PATTERNS)
+
+
+def rewrite_to_safe(_: str) -> str:
+    return (
+        "<b>Я — твой мягкий наставник AILVI.</b><br><br>"
+        "Давай сосредоточимся на тебе: ценности, сильные стороны, роли и спокойные шаги. "
+        "Сформулируй, пожалуйста, ближайший запрос — и я помогу разобрать его по-тёплому. 🌿"
     )
 
 
-def split_for_telegram(text: str, chunk: int = 3800) -> List[str]:
-    """Режет длинный HTML-текст на части поменьше."""
-    parts: List[str] = []
-    s = text
-    while len(s) > chunk:
-        cut = s.rfind("<br>", 0, chunk)
-        if cut < 0:
-            cut = chunk
-        parts.append(s[:cut])
-        s = s[cut:]
-    if s:
-        parts.append(s)
-    return parts
-
-
+# -------------------- ГЕНЕРАЦИЯ --------------------
 async def ai_reply(user_id: int, user_text: str) -> str:
-    """Генерируем ответ с учётом последних сообщений пользователя."""
-    # сохраняем пользовательское сообщение
-    await db_add_message(user_id, "user", user_text)
+    history = await db_recent_dialogue(user_id, limit_pairs=10)
 
-    history = await db_last_messages(user_id, limit=40)
-    # формируем messages для чата
-    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for role, content in history:
-        if role in {"user", "assistant"}:
-            msgs.append({"role": role, "content": content})
+        messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": user_text})
 
-    # запрос к OpenAI
-    resp = await asyncio.to_thread(
-        client.chat.completions.create,
-        model="gpt-4o-mini",
-        messages=msgs,
-        temperature=0.7,
-        max_tokens=800,
-    )
-    answer = resp.choices[0].message.content.strip()
+    def _call():
+        return client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            temperature=0.7,
+            max_tokens=800,
+        )
 
-    # сохраняем ответ ассистента
-    await db_add_message(user_id, "assistant", answer)
+    resp = await asyncio.to_thread(_call)
+    answer = (resp.choices[0].message.content or "").strip()
+
+    if contains_forbidden(answer):
+        answer = rewrite_to_safe(answer)
+
     return answer
 
 
-async def ai_report(user_id: int) -> str:
-    """Конечный «Итог» по всей истории диалога пользователя."""
-    rows = await db_last_messages(user_id, limit=1000)
-    # собираем только текстовые реплики
-    convo = []
-    for role, content in rows:
-        if role in {"user", "assistant"}:
-            tag = "Пользователь" if role == "user" else "Наставник"
-            convo.append(f"{tag}: {content}")
-
-    prompt = (
-        "Ниже переписка. Сформируй краткий и тёплый итог в HTML:\n"
-        "1) <b>Сильные стороны</b>\n"
-        "2) <b>Ценности</b>\n"
-        "3) <b>Где энергия и поток</b>\n"
-        "4) <b>Роли/форматы</b> (наброски)\n"
-        "5) <b>Малые шаги на 7–10 дней</b>\n\n"
-        "Тон: мягкий, вдохновляющий, без коуч-клише. Никаких ссылок на ИИ.\n\n"
-        "Переписка:\n" + "\n".join(convo)
-    )
-
-    resp = await asyncio.to_thread(
-        client.chat.completions.create,
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "Форматируй строго HTML, без markdown."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.5,
-        max_tokens=1400,
-    )
-    return resp.choices[0].message.content.strip()
+# -------------------- ХЭНДЛЕРЫ --------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    await db_add_user(uid)
+    await db_add_message(uid, "system", "START")
+    await update.message.reply_text(WELCOME_TEXT)
 
 
-# ---------- Хендлеры ----------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    await db_upsert_user(user.id)
-    await send_html(update, WELCOME_TEXT)
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    text = (update.effective_message.text or "").strip()
-
-    # Триггеры
-    lowered = text.lower()
-    if lowered in {"начинаем", "начать", "старт"}:
-        await db_add_message(user.id, "assistant", FIRST_QUESTION)
-        await send_html(update, FIRST_QUESTION)
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
         return
 
-    if lowered in {"итог", "покажи итог", "резюме", "отчёт", "отчет"}:
-        await send_html(update, "Готовлю твой итог… ⏳")
-        report = await ai_report(user.id)
-        for chunk in split_for_telegram(report):
-            await send_html(update, chunk)
+    uid = update.effective_user.id
+    text = (update.message.text or "").strip()
+    await db_add_user(uid)
+
+    if text.lower() in ("начинаем", "начать", "поехали"):
+        await db_add_message(uid, "user", text)
+        await update.message.reply_text(FIRST_QUESTION)
         return
 
-    # Обычная реплика пользователя → ответ наставника
+    await db_add_message(uid, "user", text)
     try:
-        answer = await ai_reply(user.id, text)
+        answer = await ai_reply(uid, text)
     except Exception as e:
-        log.exception("AI error: %s", e)
+        logging.exception("ai_reply failed: %s", e)
         answer = (
-            "<b>Небольшая задержка на линии.</b><br><br>"
-            "Попробуй написать эту мысль ещё раз — я с тобой. 🌿"
+            "<b>Небольшая задержка…</b><br><br>"
+            "Попробуй сформулировать мысль одной фразой — я рядом. 🌿"
         )
-
-    for chunk in split_for_telegram(answer):
-        await send_html(update, chunk)
-
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    txt = (
-        "<b>Команды:</b><br>"
-        "• /start — начать заново<br>"
-        "• Напиши <b>Начинаем</b> — и я запущу распаковку<br>"
-        "• Напиши <b>Итог</b> — пришлю краткое резюме твоего пути"
-    )
-    await send_html(update, txt)
+    await db_add_message(uid, "assistant", answer)
+    await update.message.reply_text(answer, disable_web_page_preview=True)
 
 
-# ---------- Запуск ----------
-def start_bot() -> None:
+# -------------------- APP --------------------
+async def on_start(app):
+    await db_init()
+    if MODE == "webhook":
+        if not WEBHOOK_BASE:
+            raise RuntimeError("WEBHOOK_BASE is empty while MODE=webhook")
+        url = f"{WEBHOOK_BASE}/tg/{WEBHOOK_SECRET}"
+        await app.bot.set_webhook(url=url, secret_token=WEBHOOK_SECRET, drop_pending_updates=True)
+        logging.info("Webhook set to %s", url)
+    else:
+        try:
+            await app.bot.delete_webhook(drop_pending_updates=True)
+        except Exception:
+            pass
+        logging.info("Webhook deleted; using long polling")
+
+
+def build_app():
+    # ВАЖНО: Defaults берём из telegram.ext.Defaults
+    defaults = Defaults(parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
     app = (
         ApplicationBuilder()
-        .token(TOKEN)
-        .defaults(  # сразу HTML по умолчанию
-            defaults=constants.Defaults(
-                parse_mode=constants.ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-        )
+        .token(TELEGRAM_BOT_TOKEN)
+        .concurrent_updates(True)
+        .defaults(defaults)
+        .http_version("1.1")
         .build()
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CommandHandler(["start", "help"], start))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
-    # инициализация БД перед стартом поллинга
-    async def _pre_start():
-        await db_init()
-        log.info("DB ready")
-
-    app.post_init = _pre_start  # выполнится перед run_polling
-
-    # ВАЖНО: никаких .wait() тут не нужно
-    app.run_polling(drop_pending_updates=True)
+    app.post_init = on_start
+    return app
 
 
 if __name__ == "__main__":
-    start_bot()
+    application = build_app()
+
+    if MODE == "webhook":
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=int(os.environ.get("PORT", "10000")),
+            secret_token=WEBHOOK_SECRET,
+            webhook_path=f"/tg/{WEBHOOK_SECRET}",
+        )
+    else:
+        application.run_polling(
+            allowed_updates=ALL_UPDATE_TYPES,
+            drop_pending_updates=True,
+            close_loop=False,
+            stop_signals=None,
+        )
