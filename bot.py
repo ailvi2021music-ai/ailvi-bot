@@ -1,314 +1,204 @@
-# bot.py
 import os
-import html
+import json
+import asyncio
 import logging
-from typing import List, Tuple
+import threading
+from datetime import datetime
 
-from flask import Flask, request
-from telegram import Update
+from flask import Flask, request, abort
+
+from telegram import Update, Bot
+from telegram.constants import ParseMode
+from telegram.error import TelegramError
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+    Application, ApplicationBuilder, CommandHandler, MessageHandler,
+    filters, ContextTypes
 )
-from openai import OpenAI
 
-# ==== Конфигурация ====
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY")
-WEBHOOK_BASE       = os.getenv("WEBHOOK_BASE")      # если используешь webhook
-WEBHOOK_SECRET     = os.getenv("WEBHOOK_SECRET")    # опционально, можно оставить пустым
-
-# Безопасный нейтральный стиль идентичности — не раскрываем платформы и провайдеров
-BOT_NAME = "AILVI_Guide"
-
-# ==== Логгер ====
+# -------------------- ЛОГИ --------------------
 logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
 log = logging.getLogger("ailvi-bot")
 
-# ==== OpenAI клиент ====
-client = OpenAI(api_key=OPENAI_API_KEY)
+# -------------------- ENV --------------------
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+DB_SSLMODE = os.environ.get("DB_SSLMODE", "require")
+MODE = os.environ.get("MODE", "polling").lower()            # polling | webhook
+WEBHOOK_BASE = os.environ.get("WEBHOOK_BASE", "")           # https://<service>.onrender.com
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "secret")
+PORT = int(os.environ.get("PORT", "10000"))
 
-# ==== Flask (если нужно держать вебхук на Render) ====
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
+ALERTS_ENABLED = os.environ.get("ALERTS_ENABLED", "true").lower() == "true"
+
+# -------------------- ALERTS --------------------
+async def alert(ctx: ContextTypes.DEFAULT_TYPE, text: str):
+    if not ALERTS_ENABLED or not ADMIN_CHAT_ID:
+        return
+    try:
+        await ctx.bot.send_message(chat_id=int(ADMIN_CHAT_ID), text=f"⚠️ {text}")
+    except Exception as e:
+        log.error("alert send failed: %s", e)
+
+# -------------------- FLASK --------------------
 app = Flask(__name__)
 
-# -----------------------------------------------------------------------------
-# УТИЛИТЫ ФОРМАТИРОВАНИЯ (HTML)
-# -----------------------------------------------------------------------------
+@app.get("/")
+def health_root():
+    return "OK", 200
 
-def esc(t: str) -> str:
-    """Экранируем пользовательский текст, чтобы HTML Telegram не сломался."""
-    return html.escape(t or "")
+@app.get("/health")
+def health():
+    # можно расширить: пинг до БД и т.д.
+    return json.dumps({"status": "ok", "time": datetime.utcnow().isoformat()}), 200, {"Content-Type": "application/json"}
 
-def b(t: str) -> str:
-    return f"<b>{t}</b>"
-
-def i(t: str) -> str:
-    return f"<i>{t}</i>"
-
-def u(t: str) -> str:
-    return f"<u>{t}</u>"
-
-def p(*lines: str) -> str:
-    """
-    Формирует абзац: объединяет строки, после абзаца ставит пустую строку.
-    Пример: p(b('Заголовок'), 'Текст абзаца.')
-    """
-    body = "".join(lines)
-    return body + "\n\n"
-
-def bullet(items: List[str]) -> str:
-    """Нумерация/маркировка со спокойными эмодзи."""
-    return "".join(f"• {item}\n" for item in items) + "\n"
-
-def chunk_telegram(text: str, limit: int = 4096) -> List[str]:
-    """Нарезаем длинный HTML-текст на куски до лимита Telegram."""
-    parts: List[str] = []
-    while len(text) > limit:
-        cut = text.rfind("\n", 0, limit)
-        if cut == -1:
-            cut = limit
-        parts.append(text[:cut])
-        text = text[cut:]
-    parts.append(text)
-    return parts
-
-async def send_html(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str):
-    """Отправка HTML-сообщения с автоматической нарезкой по лимиту."""
-    for part in chunk_telegram(text):
-        await ctx.bot.send_message(chat_id=chat_id, text=part, parse_mode="HTML")
-
-# -----------------------------------------------------------------------------
-# ТЕКСТЫ
-# -----------------------------------------------------------------------------
+# -------------------- PTB APPLICATION --------------------
+application: Application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+bot: Bot = application.bot
 
 WELCOME_TEXT = (
-    p(b("Ассаляму алейкум! ") + "👋🏻")
-    + p("Добро пожаловать в пространство, где Сердце узнаёт себя заново.")
-    + p("Пойдём спокойно, мягко, шаг за шагом. Я помогу увидеть твои природные дары, ценности и направление служения — без спешки и без давления. 💫")
-    + p(i("Чтобы начать глубокую распаковку — напиши: ") + b("Начинаем"))
+    "Ассаламу алейкум! ✨\n\n"
+    "Запускаю распаковку. Пиши коротко и по-делу — я буду вести бережно и глубоко.\n\n"
+    "Чтобы начать — напиши: *Начинаем*"
 )
 
-def first_turn_text() -> str:
-    return (
-        p(b("С радостью начинаю распаковку. ✨"))
-        + p(
-            i("Расскажи мне…")
-            + " Что сейчас самое важное для тебя? "
-            + "Это может быть поиск смысла, усталость, желание ясности в работе, тяга к переменам или мечта, которая не отпускает."
-        )
-        + bullet([
-            "«Не понимаю, где моя сила»",
-            "«Хочу ясности в работе»",
-            "«Чувствую усталость и хочу перемен»",
-        ])
-        + p("Можно коротко. 🌿")
-    )
+# --------- ГЛОБАЛЬНАЯ ОБРАБОТКА ОШИБОК ---------
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.exception("Handler error", exc_info=context.error)
+    await alert(context, f"Ошибка в обработчике: {context.error!r}")
 
-def gentle_followup(user_msg: str) -> str:
-    return (
-        p(b("Я рядом.") + " Спасибо за искренность. 🤝")
-        + p(
-            "Чтобы двигаться глубже, давай нащупаем опорные точки. "
-            + "Отвечай так, как чувствуешь — коротко, без идеальности."
-        )
-        + bullet([
-            b("Что приносит радость?") + " Вспомни моменты, когда жизнь наполнялась теплом. Какие дела или роли давали живую энергию?",
-            b("Что интересует?") + " Темы, к которым тянет. То, что давно хотелось попробовать.",
-            b("Как хочешь помогать?") + " Кому и в чём тебе естественно быть полез(н)ым?",
-        ])
-        + p(i("Пиши в свободной форме — я соберу нить и поведу дальше."))
-    )
+application.add_error_handler(on_error)
 
-def format_summary_ready() -> str:
-    return (
-        p(b("Мы собрали основу твоего пути. 🌱"))
-        + p("Хочешь получить сжатую карту того, что мы выяснили: ценности, сильные стороны, природные роли, условия среды и ближайшие эксперименты?")
-        + p(i("Если да, напиши: ") + b("Дай итог"))
-    )
-
-def summary_text(summary: str) -> str:
-    return (
-        p(b("Карта твоего пути — кратко и по делу. 🗺"))
-        + p(summary)
-        + p(i("Готов двигаться к малым экспериментам? Напиши: ") + b("Эксперименты"))
-    )
-
-# -----------------------------------------------------------------------------
-# ПРОСТЕЙШЕЕ «СОСТОЯНИЕ» В ПАМЯТИ ПРОЦЕССА (для Render Free перезапустится)
-# Для железобетона у тебя уже поднят PostgreSQL — интеграцию можно включить.
-# Здесь оставляю легковесную карту последних шагов.
-# -----------------------------------------------------------------------------
-
-# chat_id -> simple state
-STATE: dict[int, str] = {}
-
-# -----------------------------------------------------------------------------
-# ЛОГИКА ДИАЛОГА
-# -----------------------------------------------------------------------------
-
-def is_start(msg: str) -> bool:
-    m = (msg or "").strip().lower()
-    return m in ("/start", "start", "старт")
-
-def is_begin(msg: str) -> bool:
-    return (msg or "").strip().lower() == "начинаем"
-
-def is_summary_request(msg: str) -> bool:
-    m = (msg or "").strip().lower()
-    return m in ("дай итог", "итог", "выдай итог", "покажи итог")
-
-async def handle_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    STATE[chat_id] = "welcome"
-    await send_html(ctx, chat_id, WELCOME_TEXT)
-
-async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-    chat_id = update.effective_chat.id
-    user_text = update.message.text
-
-    # Фильтр на попытки «кто ты? ты chatgpt?» — мягкий отказ
-    lowered = user_text.lower()
-    if any(k in lowered for k in ["chatgpt", "openai", "gpt", "кто ты", "ты бот", "ты чатжпт"]):
-        reply = (
-            p(b("Я — AILVI_Guide.") + " Я рядом, чтобы мягко и бережно вести разговор о твоём пути. 🤝")
-            + p("Сфокусируемся на тебе и твоих шагах — так будет полезнее.")
-        )
-        await send_html(ctx, chat_id, reply)
-        return
-
-    # Ветвление по состоянию / фразам:
-    if is_start(user_text):
-        return await handle_start(update, ctx)
-
-    if is_begin(user_text):
-        STATE[chat_id] = "first_turn"
-        return await send_html(ctx, chat_id, first_turn_text())
-
-    if is_summary_request(user_text):
-        # Здесь ты можешь подставить реальную сборку из БД.
-        # Пока соберём из краткой LM-выжимки по истории (демо).
-        synthesis = build_llm_synthesis(chat_id)
-        return await send_html(ctx, chat_id, summary_text(esc(synthesis)))
-
-    # Основной диалог — сначала отвечаем тёплым структурирующим блоком,
-    # затем — берём смысл из модели и подаём мягкую следующую «ступеньку».
-    state = STATE.get(chat_id, "")
-    if state in ("first_turn", "deepening"):
-        # 1) Тёплый «ведущий» блок (фиксированный)
-        if state == "first_turn":
-            await send_html(ctx, chat_id, gentle_followup(user_text))
-            STATE[chat_id] = "deepening"
-            return
-
-        # 2) Далее — микро-петля: анализ ответа + шаг-вопрос вперёд
-        coach_answer = build_llm_step(chat_id, user_text)
-        await send_html(ctx, chat_id, coach_answer)
-
-        # Периодически предлагай итог, чтобы человек знал о возможности
-        await send_html(ctx, chat_id, format_summary_ready())
-        return
-
-    # Если пользователь написал что-то «с пустого места» — мягко запускаем поток
-    await send_html(ctx, chat_id, WELCOME_TEXT)
-
-# -----------------------------------------------------------------------------
-# ВСПОМОГАТЕЛЬНЫЕ ВЫЗОВЫ МОДЕЛИ
-# -----------------------------------------------------------------------------
-
-def build_llm_synthesis(chat_id: int) -> str:
-    """
-    Делаем компактную выжимку. Здесь можно прокинуть историю из БД.
-    Сейчас — минимальный пример: одна подсказка, без раскрытия провайдера.
-    """
-    prompt = (
-        "Собери краткую карту личности человека на основе наших недавних сообщений. "
-        "Структура: 1) Ценности; 2) Сильные стороны; 3) Интересы/среда; "
-        "4) Естественные роли; 5) Риски/дренажи; 6) Микро-эксперименты на 7–10 дней. "
-        "Пиши по-русски, спокойно, без коуч-клише. Формат — короткие пункты."
-    )
-    msg = [{"role": "user", "content": prompt}]
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",  # лёгкая и быстрая модель
-        messages=msg,
-        temperature=0.4,
-    )
-    text = resp.choices[0].message.content.strip()
+# --------- ХЕЛПЕРЫ ФОРМАТА ---------
+def md(text: str) -> str:
+    # Телеграм будет понимать MarkdownV2/HTML. Здесь используем HTML — меньше экранирования.
     return text
 
-def build_llm_step(chat_id: int, user_text: str) -> str:
-    """
-    Генерирует мягкий следующий шаг. Возвращаем уже HTML-отформатированный текст.
-    """
-    system = (
-        "Ты — бережный духовно-созерцательный наставник. Никаких упоминаний о платформах. "
-        "Говори по-русски. Тон: тёплый, спокойный, с дыханием, без давления. "
-        "Структура ответа: 1) короткое признание смысла сказанного; "
-        "2) 1–2 ясных уточняющих вопроса; 3) одна маленькая практика/наблюдение. "
-        "Не используй звёздочки для форматирования — верни разметку как HTML (<b>, <i>, абзацы)."
+# --------- ХЕНДЛЕРЫ ---------
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_chat.send_message(WELCOME_TEXT, parse_mode=ParseMode.MARKDOWN)
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+
+    if text.lower() == "начинаем":
+        reply = (
+            "<b>С радостью начинаю распаковку.</b> ✨\n\n"
+            "Скажи мне, какая тема у тебя сейчас на первом плане?\n"
+            "• работа/доход 💼\n"
+            "• призвание/смысл 🌱\n"
+            "• энергия/усталость 🔋\n"
+            "• отношения с делом/людьми 🤝\n\n"
+            "Напиши одним словом или короткой фразой."
+        )
+        await update.message.reply_html(reply)
+        return
+
+    # Это простая демонстрация шага 1: уточнение фокуса
+    reply = (
+        "<b>Понял.</b> Двигаемся бережно.\n\n"
+        "1) <b>Что приносит радость?</b>\n"
+        "Вспомни моменты/занятия, после которых внутри было светло. 1–3 примера.\n\n"
+        "2) <b>Что тянет/интересует?</b>\n"
+        "Темы, к которым возвращаешься, даже когда никто не просит.\n\n"
+        "3) <b>Как хочешь помогать?</b>\n"
+        "Кому и чем тебе естественно быть полезным?\n\n"
+        "Ответь коротко, пунктами. Я дальше соберу структуру."
     )
-    user = (
-        f"Ответ человека: «{user_text}».\n"
-        "Сделай следующий мягкий шаг, чтобы вести к распаковке ценностей/ролей/среды, "
-        "избегай разговоров про деньги до финального синтеза."
-    )
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=0.5,
-    )
-    raw = resp.choices[0].message.content.strip()
+    await update.message.reply_html(reply)
 
-    # На случай, если модель вернула обычный текст — обернём абзацами.
-    # (В идеале она уже вернёт HTML. Но подстрахуемся.)
-    if "<b>" not in raw and "<i>" not in raw and "<u>" not in raw:
-        raw = p(b("Слышу тебя.")) + p(esc(raw))
+application.add_handler(CommandHandler("start", start_command))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-    return raw
+# -------------------- WEBHOOK РОУТ --------------------
+# При MODE=webhook сюда будет постучаться Telegram
+@app.post("/telegram/<token>")
+def telegram_webhook(token: str):
+    if token != TELEGRAM_BOT_TOKEN:
+        abort(403)
+    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if secret != WEBHOOK_SECRET:
+        abort(403)
 
-# -----------------------------------------------------------------------------
-# TELEGRAM HANDLERS
-# -----------------------------------------------------------------------------
+    try:
+        data = request.get_json(force=True)
+    except Exception:
+        abort(400)
 
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await handle_start(update, ctx)
+    update = Update.de_json(data, bot)
+    # Запускаем асинхронную обработку
+    try:
+        asyncio.get_event_loop().create_task(application.process_update(update))
+    except RuntimeError:
+        # если ещё нет лупа (редко), запускаем в фоне
+        threading.Thread(target=lambda: asyncio.run(application.process_update(update)), daemon=True).start()
+    return "OK", 200
 
-async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await handle_message(update, ctx)
+# -------------------- СЛУЖЕБНЫЕ ФУНКЦИИ --------------------
+async def setup_webhook(ctx: ContextTypes.DEFAULT_TYPE):
+    url = f"{WEBHOOK_BASE}/telegram/{TELEGRAM_BOT_TOKEN}"
+    try:
+        await ctx.bot.set_webhook(
+            url=url,
+            secret_token=WEBHOOK_SECRET,
+            drop_pending_updates=True,
+        )
+        if ALERTS_ENABLED:
+            await ctx.bot.send_message(int(ADMIN_CHAT_ID), f"🛰️ Вебхук установлен:\n{url}")
+        log.info("Webhook set to %s", url)
+    except TelegramError as e:
+        log.error("set_webhook failed: %s", e)
+        raise
 
-def build_app():
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    return application
+async def delete_webhook(ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        await ctx.bot.delete_webhook(drop_pending_updates=True)
+        log.info("Webhook deleted")
+        if ALERTS_ENABLED and ADMIN_CHAT_ID:
+            await ctx.bot.send_message(int(ADMIN_CHAT_ID), "🧹 Вебхук удалён (режим polling)")
+    except TelegramError as e:
+        log.error("delete_webhook failed: %s", e)
 
-# -----------------------------------------------------------------------------
-# POINTS OF ENTRY
-# -----------------------------------------------------------------------------
+def run_polling_in_background():
+    async def runner():
+        # На polling режиме гарантированно удалим вебхук
+        await delete_webhook(application)
+        if ALERTS_ENABLED and ADMIN_CHAT_ID:
+            try:
+                await bot.send_message(int(ADMIN_CHAT_ID), "🚴 Запуск бота в режиме polling")
+            except Exception:  # не критично
+                pass
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        # updater.start_polling блокирует — держим его
+        await application.updater.wait()
+    asyncio.run(runner())
 
-telegram_app = build_app()
-
-@app.route("/", methods=["GET"])
-def health():
-    return "ok", 200
-
-@app.route("/hook", methods=["POST"])
-def webhook():
-    update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-    telegram_app.update_queue.put_nowait(update)
-    return "ok", 200
-
-def run_polling():
-    telegram_app.run_polling(allowed_updates=Update.ALL_TYPES)
-
+# -------------------- MAIN --------------------
 if __name__ == "__main__":
-    # По умолчанию — polling (для фри-плана Render удобно).
-    # Если используешь вебхук, просто настрой маршрут /hook и включи в Render.
-    log.info("Starting bot in polling mode…")
-    run_polling()
+    if MODE == "webhook":
+        # установим вебхук при старте (в фоне, после init)
+        async def init_and_set():
+            await application.initialize()
+            await application.start()
+            await setup_webhook(application)
+            if ALERTS_ENABLED and ADMIN_CHAT_ID:
+                try:
+                    await bot.send_message(int(ADMIN_CHAT_ID), "🛰️ Запуск бота в режиме webhook")
+                except Exception:
+                    pass
+        threading.Thread(target=lambda: asyncio.run(init_and_set()), daemon=True).start()
+
+        # Запускаем Flask, чтобы Render видел порт
+        app.run(host="0.0.0.0", port=PORT)
+
+    else:  # polling
+        # Запускаем polling в отдельном потоке,
+        # а Flask оставляем для health/порта, чтобы Render не ругался
+        threading.Thread(target=run_polling_in_background, daemon=True).start()
+        app.run(host="0.0.0.0", port=PORT)
