@@ -1,152 +1,142 @@
-# bot.py
 import os
 import threading
-from collections import defaultdict
+import traceback
 from flask import Flask
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters
-from telegram import Update
-from telegram.ext import ContextTypes
 from openai import OpenAI
 
-# ====== ENV ======
+# -------------------------
+# 🔑 API-ключи из переменных окружения
+# -------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ====== Flask healthcheck ======
+# -------------------------
+# 🫶 Память (per-user) в процессе
+# -------------------------
+user_state = {}       # {user_id: {"mode": "idle"|"deep", "step": int}}
+conversations = {}    # {user_id: [{"role":"system|user|assistant","content":str}]}
+
+# -------------------------
+# 🧭 Системный промпт (концентрат капсул)
+# -------------------------
+SYSTEM_PROMPT = (
+    "Ты — AILVI-проводник: мягкий, спокойный, доброжелательный. Роль: духовно-научная распаковка личности "
+    "с упором на служение Аллаху. Говори коротко, тепло, без давления; используй тёплые связки "
+    "«и знаешь…», «посмотри…», «иногда мы забываем…». Не выноси приговоров; никаких коуч-клише.\n\n"
+    "Исламский вектор: намерение ради довольства Аллаха; халяль/харам; скромность; польза. Не цитируй аяты "
+    "без запроса и не искажай смыслы.\n\n"
+    "Методика: сначала глубокая индивидуальная распаковка (до любых «дней»). Каждый следующий вопрос "
+    "рождается из ответа человека. Опирайся на наблюдаемое поведение, реальные эпизоды живости/потока, мотивы, "
+    "среду; применяй идеи VIA, Big Five, RIASEC, «поток», микро-эксперименты — но не перегружай терминами, "
+    "если их не просят. Помогай увидеть сильные стороны, ценности, естественные роли, среду раскрытия, формат "
+    "работы, гипотезы служения и маленькие шаги.\n\n"
+    "Стратегия диалога: 1) проясни намерение и ожидаемое решение; 2) попроси 2–3 живых эпизода с энергией; "
+    "3) выдели мотивы/условия; 4) предложи 1–2 гипотезы ролей и попроси отклик; 5) дай микро-шаг (≤60 минут) "
+    "и одну простую метрику; 6) спроси об ощущениях после шага. Один вопрос за раз. Мягко направляй к искреннему "
+    "обращению к Аллаху, но не отвечай вместо человека."
+)
+
+# -------------------------
+# 👋 Приветствие и сигнал запуска
+# -------------------------
+WELCOME_TEXT = (
+    "Ассаляму Алейкум уа РахматуЛлахи уа Баракятух! 👋🏻\n\n"
+    "Добро пожаловать в пространство, где Сердце узнаёт себя заново.\n\n"
+    "Давай вместе, спокойно, шаг за шагом откроем драгоценные дары, которые Аллах уже вложил "
+    "в твою Душу — силы, таланты, намерения, которые ждут, когда ты увидишь их Свет. 💎\n\n"
+    "Пусть Аллах сделает этот путь лёгким, благословенным и наполненным пониманием!\n\n"
+    "Чтобы начать глубокую распаковку — напиши: «Начинаем»"
+)
+
+DEEP_INTRO_USER_CUE = (
+    "Начни глубокую распаковку до любых «дней». Сформулируй первый мягкий вопрос по намерению "
+    "и ожидаемому решению (1 вопрос, 1–2 строки, с примером формулировки ответа)."
+)
+
+# -------------------------
+# ✅ Flask health-check (для Render)
+# -------------------------
 app = Flask(__name__)
-@app.get("/")
+
+@app.route("/")
 def home():
     return "AILVI bot is alive"
+
 def run_flask():
     app.run(host="0.0.0.0", port=10000)
 
-# ====== In-memory sessions (простое состояние на тест) ======
-# sessions[chat_id] = {
-#   "started": bool,
-#   "day": "day1",
-#   "step": "intent_1" | "intent_2" | "alive_episodes_1" | "alive_episodes_2" | "summary_1",
-#   "trace": [ {"q": "...", "a": "..."} ],
-# }
-sessions = defaultdict(dict)
+# -------------------------
+# 🤖 Вызовы модели
+# -------------------------
+def ai_reply(user_id: int, user_text: str) -> str:
+    if user_id not in conversations:
+        conversations[user_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    conversations[user_id].append({"role": "user", "content": user_text})
 
-# Небольшая карта прогресса на День 1 (достаточно для прогона; расширим позже)
-FLOW = {
-    "day1": ["intent_1", "intent_2", "alive_episodes_1", "alive_episodes_2", "summary_1"]
-}
-
-def _next_step(day: str, current: str) -> str | None:
-    steps = FLOW.get(day, [])
-    if current not in steps:
-        return steps[0] if steps else None
-    idx = steps.index(current)
-    return steps[idx+1] if idx + 1 < len(steps) else None
-
-# ====== GPT helper ======
-SYSTEM_BASE = (
-    "Ты — мягкий и точный проводник AILVI. Ведёшь человека по глубокой распаковке личности. "
-    "Говоришь коротко, тепло и конкретно. Ни приветствий, ни «как дела». "
-    "Всегда задавай ровно ОДИН фокус-вопрос, максимум 1–2 предложения. "
-    "Не давай мини-лекций. Никакой болтовни. Вопрос рождай из последнего ответа пользователя."
-)
-
-def gpt_question(module_hint: str, history: list[dict], user_answer: str | None) -> str:
-    """
-    Возвращает один следующий вопрос. history — список {'q','a'}.
-    module_hint определяет смысловой блок (шаг).
-    """
-    # Сжимаем историю в компактный контекст
-    brief = []
-    for turn in history[-6:]:  # последних 6 пар достаточно
-        brief.append(f"Q: {turn['q']}\nA: {turn['a']}")
-    brief_text = "\n".join(brief) if brief else "пока ответов нет"
-
-    module_instruction = {
-        "intent_1": "Модуль: День 1 — Намерение и рамка. Задай вопрос, который проясняет зачем человеку распаковка и какое решение он хочет принять.",
-        "intent_2": "Уточни цель: какая польза/изменение ожидается для себя и других? Спросить конкретнее.",
-        "alive_episodes_1": "Переход к «дням, когда я живой». Попроси описать 1 свежий эпизод: контекст, что делал, с кем, почему чувствовалась энергия.",
-        "alive_episodes_2": "Попроси второй эпизод по той же форме, чтобы увидеть повторяющиеся мотивы.",
-        "summary_1": "Попроси коротко назвать 2–3 наблюдения, что повторяется в эпизодах (мотивы, условия, роли). Один вопрос."
-    }.get(module_hint, "Задай один уместный следующий вопрос по распаковке.")
-
-    messages = [
-        {"role": "system", "content": SYSTEM_BASE},
-        {"role": "system", "content": module_instruction},
-        {"role": "system", "content": f"Краткая история диалога:\n{brief_text}"},
-    ]
-    if user_answer:
-        messages.append({"role": "user", "content": user_answer})
-
+    msgs = [conversations[user_id][0]] + conversations[user_id][-16:]
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
-        temperature=0.3,
-        messages=messages,
+        temperature=0.6,
+        max_tokens=400,
+        messages=msgs,
     )
-    return resp.choices[0].message.content.strip()
+    answer = resp.choices[0].message.content
+    conversations[user_id].append({"role": "assistant", "content": answer})
+    return answer
 
-# ====== Telegram handlers ======
-WELCOME = (
-    "Ассаляму Алейкум. Запускаю распаковку.\n"
-    "День 1 — *Намерение и рамка*.\n"
-    "Отвечай свободно, коротко и по-делу — я буду вести шаг за шагом."
-)
+def ai_first_probe(user_id: int) -> str:
+    conversations[user_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.6,
+        max_tokens=300,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": DEEP_INTRO_USER_CUE},
+        ],
+    )
+    answer = resp.choices[0].message.content
+    conversations[user_id].append({"role": "assistant", "content": answer})
+    return answer
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    s = sessions[chat_id]
-    s.clear()
-    s["started"] = True
-    s["day"] = "day1"
-    s["step"] = "intent_1"
-    s["trace"] = []
-    # Сразу первый вопрос без «как дела»
-    q = gpt_question("intent_1", s["trace"], user_answer=None)
-    await update.message.reply_text(WELCOME, parse_mode="Markdown")
-    await update.message.reply_text(q)
+# -------------------------
+# 📲 Telegram handlers
+# -------------------------
+async def start(update, context):
+    user_id = update.effective_user.id
+    user_state[user_id] = {"mode": "idle", "step": 0}
+    conversations.pop(user_id, None)
+    await update.message.reply_text(WELCOME_TEXT)
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    text = update.message.text.strip()
+async def handle_message(update, context):
+    try:
+        user_id = update.effective_user.id
+        text = (update.message.text or "").strip()
 
-    s = sessions[chat_id]
-    # Если сессии нет — инициируем как при /start
-    if not s.get("started"):
-        s["started"] = True
-        s["day"] = "day1"
-        s["step"] = "intent_1"
-        s["trace"] = []
-        await update.message.reply_text(WELCOME, parse_mode="Markdown")
-        q = gpt_question("intent_1", s["trace"], user_answer=None)
-        await update.message.reply_text(q)
-        return
+        # Старт глубокой распаковки
+        if text.lower() == "начинаем":
+            user_state[user_id] = {"mode": "deep", "step": 1}
+            first = ai_first_probe(user_id)
+            await update.message.reply_text(first)
+            return
 
-    # Записываем последний ответ
-    last_q = s["trace"][-1]["q"] if s["trace"] else "(первый вопрос)"
-    s["trace"].append({"q": last_q, "a": text})
+        mode = user_state.get(user_id, {}).get("mode", "idle")
+        if mode == "idle":
+            await update.message.reply_text(
+                "Напиши «Начинаем», и мы сразу перейдём к глубокой распаковке. "
+                "Чтобы обновить приветствие — отправь /start."
+            )
+            return
 
-    # Генерируем следующий вопрос в рамках текущего шага
-    step = s["step"]
-    q = gpt_question(step, s["trace"], user_answer=text)
-    await update.message.reply_text(q)
+        answer = ai_reply(user_id, text)
+        await update.message.reply_text(answer)
 
-    # Решаем — оставаться в шаге или двигаться дальше
-    # Простая логика: после intent_1 → intent_2; после intent_2 → alive_episodes_1; после alive_episodes_2 → summary_1
-    # (при необходимости уточним пороги/условия)
-    step_next = {
-        "intent_1": "intent_2",
-        "intent_2": "alive_episodes_1",
-        "alive_episodes_1": "alive_episodes_2",
-        "alive_episodes_2": "summary_1",
-        "summary_1": None
-    }.get(step)
-
-    if step_next:
-        s["step"] = step_next
-    else:
-        # Завершили День 1 — дадим мягкое завершение и предложим продолжить позже
-        await update.message.reply_text(
-            "Спасибо. У нас есть первичная рамка и наблюдения. Готов продолжить в следующий раз — перейдём к ценностям и картированию энергии."
-        )
+    except Exception as e:
+        print("Error in handle_message:", e, traceback.format_exc())
+        await update.message.reply_text("Похоже, возникла техническая заминка. Попробуй ещё раз.")
 
 def run_telegram():
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
@@ -155,8 +145,10 @@ def run_telegram():
     print("✅ Telegram polling started")
     application.run_polling()
 
-# ====== Main ======
+# -------------------------
+# 🚀 Main
+# -------------------------
 if __name__ == "__main__":
-    t = threading.Thread(target=run_flask, daemon=True)
-    t.start()
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
     run_telegram()
