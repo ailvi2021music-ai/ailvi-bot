@@ -4,7 +4,6 @@ import logging
 from typing import Optional
 
 from telegram import Update
-from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
@@ -47,7 +46,6 @@ FIRST_DEEP_PROMPT = (
     "Напиши одним словом или фразой (например: «призвание», «ясность в шагах»)."
 )
 
-# «Мост» если человек сразу пишет «работа»
 BRIDGE_TO_DEPTH = (
     "Понимаю, тема работы важна. И чтобы решение было <b>живым и устойчивым</b>, "
     "пройдём короткую внутреннюю настройку:\n\n"
@@ -57,7 +55,6 @@ BRIDGE_TO_DEPTH = (
     "Ответь коротко. Из этого сложим направление и первые шаги. 🌿"
 )
 
-# Следующая подсказка после первого «я не знаю»
 GENTLE_PROGRESS = (
     "Это нормально — быть в поиске. Давай поможем сердцу заговорить:\n\n"
     "— Назови 2–3 занятия, где ты забываешь о времени.\n"
@@ -65,18 +62,15 @@ GENTLE_PROGRESS = (
     "— Какая простая польза для людей вдохновляет (без пафоса — по-доброму и реально)?"
 )
 
-# Ответ, если спрашивают «кто ты? ChatGPT? OpenAI?»
 IDENTITY_DEFLECT = (
     "Я — твой бережный проводник и диалоговый помощник внутри проекта AILVI. 🌿\n"
     "Моя задача — аккуратно наводить ясность, задавать правильные вопросы и держать направление: "
     "исламские ориентиры, мягкость, польза и шаги к делу."
 )
 
-# ---------------------- ХЕЛПЕРЫ ----------------------
 INTENT_WORK_KEYWORDS = [
     "работ", "карьер", "вакан", "деньг", "доход", "профес", "дело", "зараб"
 ]
-
 ASKS_IDENTITY = re.compile(r"(openai|gpt|chatgpt|чатгпт|кто ты|что ты|какая ты модель)", re.I)
 
 def mentions_work(text: str) -> bool:
@@ -98,41 +92,32 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
-    # защита от расспросов о «кто ты / OpenAI»
     if ASKS_IDENTITY.search(text):
         await update.message.reply_html(IDENTITY_DEFLECT)
         return
 
-    # запуск распаковки
     if text.lower() == "начинаем":
         context.user_data["phase"] = "onboarding1"
         await update.message.reply_html(FIRST_DEEP_PROMPT)
         return
 
-    # если человек ещё не начал, мягко подсказать
     if "phase" not in context.user_data:
-        await update.message.reply_html(
-            "Чтобы начать распаковку — напиши: <b>Начинаем</b> ✨"
-        )
+        await update.message.reply_html("Чтобы начать распаковку — напиши: <b>Начинаем</b> ✨")
         return
 
-    # если написали «работа/деньги» — делаем мост к глубине
     if mentions_work(text):
         context.user_data["phase"] = "work_bridge"
         await update.message.reply_html(BRIDGE_TO_DEPTH)
         return
 
-    # «не знаю» — мягкая поддержка, следующий шаг
     if is_unknown(text):
         await update.message.reply_html(GENTLE_PROGRESS)
         return
 
-    # общий «продолжатель»: сохраняем краткую память хода и двигаем дальше вопросами
     history = context.user_data.setdefault("notes", [])
     if len(text) <= 800:
         history.append(text)
 
-    # Небольшой ритм вопросов (нейтральные, без пола)
     followups = [
         "Отмечу. Что из сказанного для тебя самое живое <i>сейчас</i>?",
         "Если сузить фокус до одного шага на 7 дней — какой шаг будет самым добрым и реальным? ✍️",
@@ -146,17 +131,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_html(msg)
 
-# ---------------------- СЕРВИС ----------------------
 async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("OK")
 
 def main():
-    app = (
-        ApplicationBuilder()
-        .token(TOKEN)
-        .parse_mode(ParseMode.HTML)  # HTML форматирование по умолчанию
-        .build()
-    )
+    app = ApplicationBuilder().token(TOKEN).build()  # ВАЖНО: без .parse_mode()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("reset", cmd_reset))
