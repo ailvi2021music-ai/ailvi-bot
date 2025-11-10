@@ -1,60 +1,167 @@
 import os
+import re
 import logging
+from typing import Optional
+
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ContextTypes,
-    filters, Defaults
+    ApplicationBuilder,
+    ContextTypes,
+    MessageHandler,
+    CommandHandler,
+    filters,
 )
 
-# ===== Логирование =====
+# ---------------------- ЛОГИ ----------------------
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
 )
 log = logging.getLogger("ailvi-bot")
 
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+# ---------------------- НАСТРОЙКИ ----------------------
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+MODE = os.getenv("MODE", "polling").strip().lower()  # polling | webhook (мы используем polling)
 
-WELCOME = (
-    "<b>Ассаляму Алейкум уа РахматуЛлахи уа Баракятух! 👋🏻</b>\n\n"
-    "Добро пожаловать в пространство, где <i>Сердце</i> узнаёт себя заново.\n\n"
-    "Чтобы начать глубокую распаковку — напиши: <b>Начинаем</b>"
+if not TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN отсутствует в переменных окружения.")
+
+# ---------------------- ТЕКСТЫ (HTML) ----------------------
+WELCOME_TEXT = (
+    "<b>Ассаляму Алейкум уа РахматуЛлахи уа Баракятух!</b> 👋🏻\n\n"
+    "Добро пожаловать в пространство, где <b>Сердце</b> узнаёт себя заново.\n\n"
+    "Пойдём мягко, шаг за шагом, чтобы открыть дары, которые Аллах уже вложил "
+    "в твою душу — силы, таланты и намерения, которые ждут, когда ты увидишь их свет. 💎\n\n"
+    "Пусть Аллах сделает этот путь лёгким, благословенным и наполненным пониманием!\n\n"
+    "Чтобы начать глубокую распаковку — напиши: <b>Начинаем</b> ✨"
 )
 
-STARTED = (
-    "С радостью. Начнём с самого важного для тебя сейчас. ✨\n\n"
-    "<b>Расскажи коротко</b>: что прямо сейчас больше всего волнует — "
-    "про смысл, призвание, отношения с работой или ощущение себя?"
+FIRST_DEEP_PROMPT = (
+    "Начнём с самого важного для тебя сейчас. ✨\n\n"
+    "Скажи коротко, какая область зовёт сильнее всего сегодня:\n"
+    "— <i>смысл/призвание</i>,\n"
+    "— <i>внутреннее состояние</i>,\n"
+    "— <i>отношения с работой/делом</i>,\n"
+    "— <i>ясность в шагах</i>.\n\n"
+    "Напиши одним словом или фразой (например: «призвание», «ясность в шагах»)."
 )
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    log.info("Start from %s", update.effective_user.id if update.effective_user else "?")
-    await update.message.reply_html(WELCOME, disable_web_page_preview=True)
+# «Мост» если человек сразу пишет «работа»
+BRIDGE_TO_DEPTH = (
+    "Понимаю, тема работы важна. И чтобы решение было <b>живым и устойчивым</b>, "
+    "пройдём короткую внутреннюю настройку:\n\n"
+    "1) Что из того, что ты делал(а) когда-либо, приносило <b>тихую радость</b>? ✨\n"
+    "2) В каких моментах ты чувствовал(а): «<i>это по-настоящему моё</i>»?\n"
+    "3) Какая польза для людей откликается сердцу — <i>какому человеку ты хочешь помочь и в чём</i>?\n\n"
+    "Ответь коротко. Из этого сложим направление и первые шаги. 🌿"
+)
 
-async def any_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (update.message.text or "").strip().lower()
-    log.info("Text from %s: %s", update.effective_user.id if update.effective_user else "?", text)
+# Следующая подсказка после первого «я не знаю»
+GENTLE_PROGRESS = (
+    "Это нормально — быть в поиске. Давай поможем сердцу заговорить:\n\n"
+    "— Назови 2–3 занятия, где ты забываешь о времени.\n"
+    "— Что тебя <i>утомляет</i> больше всего (это поможет понять, чего не брать)?\n"
+    "— Какая простая польза для людей вдохновляет (без пафоса — по-доброму и реально)?"
+)
 
-    if text == "начинаем":
-        await update.message.reply_html(STARTED)
+# Ответ, если спрашивают «кто ты? ChatGPT? OpenAI?»
+IDENTITY_DEFLECT = (
+    "Я — твой бережный проводник и диалоговый помощник внутри проекта AILVI. 🌿\n"
+    "Моя задача — аккуратно наводить ясность, задавать правильные вопросы и держать направление: "
+    "исламские ориентиры, мягкость, польза и шаги к делу."
+)
+
+# ---------------------- ХЕЛПЕРЫ ----------------------
+INTENT_WORK_KEYWORDS = [
+    "работ", "карьер", "вакан", "деньг", "доход", "профес", "дело", "зараб"
+]
+
+ASKS_IDENTITY = re.compile(r"(openai|gpt|chatgpt|чатгпт|кто ты|что ты|какая ты модель)", re.I)
+
+def mentions_work(text: str) -> bool:
+    t = text.lower()
+    return any(k in t for k in INTENT_WORK_KEYWORDS)
+
+def is_unknown(text: str) -> bool:
+    return text.strip().lower() in {"не знаю", "не знаю.", "не уверен", "не уверена", "не понимаю"}
+
+# ---------------------- HANDLERS ----------------------
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_html(WELCOME_TEXT, disable_web_page_preview=True)
+
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_html("Память диалога очищена. Можем начать заново: напиши <b>Начинаем</b>.")
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+
+    # защита от расспросов о «кто ты / OpenAI»
+    if ASKS_IDENTITY.search(text):
+        await update.message.reply_html(IDENTITY_DEFLECT)
         return
 
-    await update.message.reply_html(
-        f"Я с тобой. Ты написал(а): <i>{update.message.text}</i>\n\n"
-        "Если готов(а) к распаковке — напиши: <b>Начинаем</b>"
+    # запуск распаковки
+    if text.lower() == "начинаем":
+        context.user_data["phase"] = "onboarding1"
+        await update.message.reply_html(FIRST_DEEP_PROMPT)
+        return
+
+    # если человек ещё не начал, мягко подсказать
+    if "phase" not in context.user_data:
+        await update.message.reply_html(
+            "Чтобы начать распаковку — напиши: <b>Начинаем</b> ✨"
+        )
+        return
+
+    # если написали «работа/деньги» — делаем мост к глубине
+    if mentions_work(text):
+        context.user_data["phase"] = "work_bridge"
+        await update.message.reply_html(BRIDGE_TO_DEPTH)
+        return
+
+    # «не знаю» — мягкая поддержка, следующий шаг
+    if is_unknown(text):
+        await update.message.reply_html(GENTLE_PROGRESS)
+        return
+
+    # общий «продолжатель»: сохраняем краткую память хода и двигаем дальше вопросами
+    history = context.user_data.setdefault("notes", [])
+    if len(text) <= 800:
+        history.append(text)
+
+    # Небольшой ритм вопросов (нейтральные, без пола)
+    followups = [
+        "Отмечу. Что из сказанного для тебя самое живое <i>сейчас</i>?",
+        "Если сузить фокус до одного шага на 7 дней — какой шаг будет самым добрым и реальным? ✍️",
+        "Представь человека, которому это принесёт пользу. Кто он и чем ты можешь быть ему полезен(на)?",
+        "Хочешь, я соберу из ответов короткий перечень твоих опор и шагов?",
+    ]
+
+    i = context.user_data.setdefault("followup_idx", 0)
+    msg = followups[i % len(followups)]
+    context.user_data["followup_idx"] = i + 1
+
+    await update.message.reply_html(msg)
+
+# ---------------------- СЕРВИС ----------------------
+async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("OK")
+
+def main():
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .parse_mode(ParseMode.HTML)  # HTML форматирование по умолчанию
+        .build()
     )
 
-def main() -> None:
-    if not TOKEN:
-        raise SystemExit("TELEGRAM_BOT_TOKEN is not set")
-
-    # Включаем HTML глобально
-    defaults = Defaults(parse_mode=ParseMode.HTML)
-
-    app = Application.builder().token(TOKEN).defaults(defaults).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, any_text))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("health", cmd_health))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     log.info("Application started (polling)")
     app.run_polling(close_loop=False)
