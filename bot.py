@@ -2,9 +2,12 @@ import os
 import logging
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, ContextTypes,
+    filters, Defaults
+)
 
-# ===== Логирование, чтобы в логе было видно каждый апдейт =====
+# ===== Логирование =====
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO
 )
@@ -36,7 +39,6 @@ async def any_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_html(STARTED)
         return
 
-    # Эхо-ответ, чтобы точно видеть, что бот жив и принимает апдейты
     await update.message.reply_html(
         f"Я с тобой. Ты написал(а): <i>{update.message.text}</i>\n\n"
         "Если готов(а) к распаковке — напиши: <b>Начинаем</b>"
@@ -46,13 +48,15 @@ def main() -> None:
     if not TOKEN:
         raise SystemExit("TELEGRAM_BOT_TOKEN is not set")
 
-    app = Application.builder().token(TOKEN).parse_mode(ParseMode.HTML).build()
+    # Включаем HTML глобально
+    defaults = Defaults(parse_mode=ParseMode.HTML)
+
+    app = Application.builder().token(TOKEN).defaults(defaults).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, any_text))
 
     log.info("Application started (polling)")
-    # Поллинг — никаких вебхуков и портов
     app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
